@@ -110,15 +110,17 @@ function Get-Culprit($pos) {
     $root = [MouseSpin.Native+Win]::GetAncestor($hwnd, $GA_ROOT)
     if ($root -eq [IntPtr]::Zero) { $root = $hwnd }
 
-    $pid = 0
-    [void][MouseSpin.Native+Win]::GetWindowThreadProcessId($root, [ref] $pid)
+    # NB: do NOT use $pid here - it's PowerShell's read-only automatic variable
+    # (case-insensitive), so assigning to it throws. Use a distinct name.
+    [uint32] $targetPid = 0
+    [void][MouseSpin.Native+Win]::GetWindowThreadProcessId($root, [ref] $targetPid)
     $proc = $null
-    try { $proc = Get-Process -Id $pid -ErrorAction Stop } catch {}
+    try { $proc = Get-Process -Id $targetPid -ErrorAction Stop } catch {}
     $hung = [MouseSpin.Native+Win]::IsHungAppWindow($root)
 
     [pscustomobject]@{
         Name = if ($proc) { $proc.ProcessName } else { '(unknown)' }
-        Pid  = $pid
+        Pid  = $targetPid
         Via  = $via
         Hung = $hung
         Title = if ($proc) { $proc.MainWindowTitle } else { '' }
