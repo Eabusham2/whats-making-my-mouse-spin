@@ -27,36 +27,18 @@ For each spin it reports:
 
 | File | Type | Needs | Best for |
 |------|------|-------|----------|
-| `mouse_spin_gui.c` | **GUI** (native Win32) | a C compiler once | a tiny standalone `.exe`, no runtime deps |
-| `mouse_spin_gui.py` | **GUI** (tkinter) | Python | running a window immediately, no compile |
+| `mouse_spin_gui.py` | **GUI** (tkinter) | Python | a live window, no compile |
 | `mouse_spin_detector.py` | CLI | Python | scripting, `--watch` summaries |
 | `Find-MouseSpin.ps1` | CLI | nothing (PowerShell) | zero-install quick check |
 
-All four report the same thing; they just differ in packaging.
+All three report the same thing; they just differ in packaging.
 
-## GUI versions
+## GUI version — `mouse_spin_gui.py`
 
 A small always-on-top window that live-updates: green = no spin, orange =
 pointer spin, red = full spin, and it names the culprit process + PID + whether
-it's hung.
-
-### Native `.exe` — `mouse_spin_gui.c`
-
-No runtime dependencies; compile once and run the `.exe`.
-
-```powershell
-# MSVC (from a "Developer Command Prompt for VS")
-cl /W4 /O2 mouse_spin_gui.c /link user32.lib gdi32.lib /SUBSYSTEM:WINDOWS
-
-# or MinGW-w64
-gcc mouse_spin_gui.c -o mouse_spin_gui.exe -mwindows -luser32 -lgdi32
-
-.\mouse_spin_gui.exe
-```
-
-### No-compile — `mouse_spin_gui.py`
-
-Uses `tkinter`, which ships with the standard Windows Python installer.
+it's hung. Uses `tkinter`, which ships with the standard Windows Python
+installer, so there's nothing to install.
 
 ```powershell
 python mouse_spin_gui.py

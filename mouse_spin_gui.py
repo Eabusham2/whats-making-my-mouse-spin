@@ -14,8 +14,7 @@ Run:
     python mouse_spin_gui.py
 
 tkinter ships with the standard Windows Python installer, so there's nothing to
-install. If you'd rather have a single native .exe with no Python at all, build
-mouse_spin_gui.c instead.
+install.
 """
 
 import sys
