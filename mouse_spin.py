@@ -46,7 +46,7 @@ import time
 
 IS_WINDOWS = sys.platform == "win32"
 
-POLL_MS = 150  # GUI poll interval
+POLL_MS = 100  # GUI poll interval (fast enough to catch brief spins)
 
 # status kind -> (background colour, headline)
 STYLES = {
@@ -209,6 +209,10 @@ if IS_WINDOWS:
                     ("dwFlags", wintypes.DWORD),
                     ("szExeFile", wintypes.WCHAR * 260)]
 
+    class FILETIME(ctypes.Structure):
+        _fields_ = [("dwLowDateTime", wintypes.DWORD),
+                    ("dwHighDateTime", wintypes.DWORD)]
+
     # --- detection bindings ------------------------------------------------- #
     user32.GetCursorInfo.argtypes = [ctypes.POINTER(CURSORINFO)]
     user32.GetCursorInfo.restype = wintypes.BOOL
@@ -294,6 +298,10 @@ if IS_WINDOWS:
     kernel32.Process32FirstW.restype = wintypes.BOOL
     kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
     kernel32.Process32NextW.restype = wintypes.BOOL
+    kernel32.GetProcessTimes.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(FILETIME), ctypes.POINTER(FILETIME),
+        ctypes.POINTER(FILETIME), ctypes.POINTER(FILETIME)]
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
 
 
 # --------------------------------------------------------------------------- #
@@ -370,6 +378,25 @@ def _process_image(pid):
         buf = ctypes.create_unicode_buffer(1024)
         if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
             return buf.value
+    finally:
+        kernel32.CloseHandle(handle)
+    return None
+
+
+def _process_cpu_ticks(pid):
+    """Total CPU time (kernel+user) for a PID in 100-ns units, or None."""
+    if not pid:
+        return None
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return None
+    try:
+        c, e, k, u = FILETIME(), FILETIME(), FILETIME(), FILETIME()
+        if kernel32.GetProcessTimes(handle, ctypes.byref(c), ctypes.byref(e),
+                                    ctypes.byref(k), ctypes.byref(u)):
+            kt = (k.dwHighDateTime << 32) | k.dwLowDateTime
+            ut = (u.dwHighDateTime << 32) | u.dwLowDateTime
+            return kt + ut
     finally:
         kernel32.CloseHandle(handle)
     return None
@@ -549,14 +576,21 @@ class SpinForensics:
     NEW_WINDOW_S = 6.0   # a process this freshly created is a likely trigger
     HISTORY_S = 90.0
 
+    BUSY_PCT = 12.0      # a process this busy is a plausible "why"
+    CPU_EVERY_S = 0.5    # how often to resample CPU (it is the costly part)
+
     def __init__(self, own_pid):
         self.own_pid = own_pid
         self._prev_pids = None
         self._snapshot = {}
         self._creations = collections.deque()  # (monotonic_ts, pid, name, ppid)
+        self._ncpu = max(1, os.cpu_count() or 1)
+        self._cpu = {}            # pid -> cpu percent (last computed)
+        self._cpu_prev = {}       # pid -> cpu ticks (previous sample)
+        self._cpu_t = 0.0         # perf_counter of last sample
 
     def poll(self):
-        """Refresh the process list and record anything newly created."""
+        """Refresh the process list, record new processes, resample CPU."""
         snap = snapshot_processes()
         if not snap:
             return self._snapshot
@@ -572,7 +606,40 @@ class SpinForensics:
             self._creations.popleft()
         self._prev_pids = set(snap.keys())
         self._snapshot = snap
+        self._sample_cpu()
         return snap
+
+    def _sample_cpu(self):
+        """Throttled per-process CPU%, so a busy background task can be named."""
+        now = time.perf_counter()
+        if self._cpu_t and (now - self._cpu_t) < self.CPU_EVERY_S:
+            return
+        dt = (now - self._cpu_t) if self._cpu_t else 0.0
+        pct, newprev = {}, {}
+        for pid in list(self._snapshot.keys()):
+            if pid == self.own_pid:
+                continue
+            ticks = _process_cpu_ticks(pid)
+            if ticks is None:
+                continue
+            newprev[pid] = ticks
+            if dt and pid in self._cpu_prev:
+                cpu = ((ticks - self._cpu_prev[pid]) / 1e7) / (dt * self._ncpu) * 100.0
+                if cpu >= 1.0:
+                    pct[pid] = cpu
+        self._cpu_prev = newprev
+        self._cpu = pct
+        self._cpu_t = now
+
+    def _busy(self, exclude_pids, limit=3):
+        items = sorted(((c, p) for p, c in self._cpu.items()
+                        if c >= self.BUSY_PCT and p not in exclude_pids),
+                       reverse=True)
+        out = []
+        for cpu, pid in items[:limit]:
+            name, ppid = self._snapshot.get(pid, (None, None))
+            out.append({"pid": pid, "name": name, "ppid": ppid, "cpu": cpu})
+        return out
 
     def _enrich(self, pid, name, ppid, via="new-process"):
         image = _process_image(pid)
@@ -664,9 +731,31 @@ class SpinForensics:
                            "parent": "", "image": None, "notes": "not responding",
                            "via": "hung", "hung": True}
 
+        # 4) Busy in the background - catches headless work with no new process,
+        #    no owning window, and no hang (e.g. an indexer or an updater).
+        seen_pids = {self.own_pid}
+        if primary:
+            seen_pids.add(primary["pid"])
+        busy = self._busy(seen_pids)
+        if busy:
+            lines = ["Working hard right now (high CPU):"]
+            for b in busy:
+                lines.append("  - %s (PID %s)  %.0f%% CPU"
+                             % (b["name"] or "(unknown)", b["pid"], b["cpu"]))
+            sections.append("\n".join(lines))
+            if primary is None:
+                b0 = busy[0]
+                parent = self._snapshot.get(b0["ppid"], (None, None))[0]
+                primary = {"name": b0["name"], "pid": b0["pid"],
+                           "ppid": b0["ppid"] or "", "parent": parent or "(unknown)",
+                           "image": _process_image(b0["pid"]),
+                           "notes": "high CPU (%.0f%%)" % b0["cpu"],
+                           "via": "high-cpu", "hung": False}
+
         if not sections:
             sections.append("Spinning, but I couldn't pin down a cause - possibly a "
-                            "hidden background process with no window.")
+                            "hidden background process. Try running as Administrator "
+                            "so more processes are visible.")
 
         return short, "\n\n".join(sections), primary
 
@@ -1148,8 +1237,8 @@ def main():
                         help="print one snapshot to the terminal and exit")
     parser.add_argument("--watch", action="store_true",
                         help="terminal mode: watch and report changes live")
-    parser.add_argument("-i", "--interval", type=float, default=0.2,
-                        help="poll interval in seconds for --watch (default 0.2)")
+    parser.add_argument("-i", "--interval", type=float, default=0.15,
+                        help="poll interval in seconds for --watch (default 0.15)")
     parser.add_argument("-d", "--duration", type=float, default=0,
                         help="stop --watch after N seconds (0 = until Ctrl+C)")
     args = parser.parse_args()

@@ -12,6 +12,8 @@ it can find and showing them together — whatever the reason turns out to be:
   installer, or a script;
 - the **window/process that owns the cursor** at that moment;
 - anything **not responding / hung**, since a frozen app freezes the cursor;
+- a **busy background process** (high CPU) — the catch-all for headless work
+  that has no window and didn't just spawn (an indexer, an updater, a sync job);
 - neutral **notes** on each launch (script/interpreter, runs-from-Temp, started
   by an Office app, …) so you can tell what *kind* of thing it was;
 - a **spin history** and an optional **CSV log** so you can catch things that
@@ -117,9 +119,18 @@ kept the cursor spinning the longest.
 4. **Find what's hung.** `EnumWindows` sweeps every visible, titled top-level
    window and lists any that are **not responding** (`IsHungAppWindow`), since a
    frozen app freezes the cursor.
+5. **Find what's busy.** A throttled per-process CPU sample (`GetProcessTimes`,
+   every ~0.5 s) names any process burning CPU right now — the catch-all reason
+   when nothing newly spawned, no window owns the cursor, and nothing is hung.
 
-All three are shown together. The tool excludes **its own** PID/window so it
-never blames itself.
+All of these are shown together, so there's almost always a concrete reason. The
+tool excludes **its own** PID/window so it never blames itself.
+
+> **"100% of the time"?** As close as a poll-based tool can get: the GUI samples
+> every ~100 ms, and the five signals above are designed so *something* explains
+> nearly every spin. The honest gaps: a spin shorter than one poll, or a process
+> you can't open without admin rights — so run it **as Administrator** for the
+> best coverage.
 
 ## Limitations / honesty
 
