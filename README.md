@@ -39,8 +39,15 @@ python mouse_spin.py --watch -d 60   # watch 60s, then print a summary
 ### The GUI
 
 A small window that live-updates: **green = no spin, orange = pointer spin,
-red = full spin**, naming the culprit process + PID + how it was attributed +
-whether the window is hung. Three toggles:
+red = full spin**, naming the culprit process + PID + path + how it was
+attributed + whether the window is hung. It also:
+
+- shows **how long** the current spin has lasted (in the headline);
+- lists **every other not-responding app** system-wide, so you catch all the
+  "process(s)" jamming things up, not just the one under the pointer;
+- lets you **click the details to copy** them to the clipboard.
+
+Three toggles:
 
 - **Always on top** — keep the window above everything else.
 - **Hide in tray (top-arrow area)** — tuck it into the Windows notification
@@ -50,7 +57,8 @@ whether the window is hung. Three toggles:
   never stuck.
 - **Show window when a spin is detected** — pair this with *Hide in tray* and
   the app lives quietly in the tray, then pops itself up the instant something
-  makes your mouse spin, and tucks away again when it stops.
+  makes your mouse spin, and tucks away again when it stops. (If you leave this
+  off while hidden, you instead get a **balloon toast** naming the culprit.)
 
 ### The terminal mode
 
@@ -59,7 +67,11 @@ SPINNING DETECTED -> pointer spin (working-in-background cursor)
   Process:  Code.exe   (PID 12345)
   Window:  "main.py - Visual Studio Code"
   Via:  under-cursor
+  Path:  C:\Users\you\AppData\Local\Programs\Microsoft VS Code\Code.exe
   State:  NOT RESPONDING (hung)
+
+  Also not responding:
+    - Outlook.exe (PID 6789)
 ```
 
 `--watch` samples on an interval and, with `-d`, prints a summary ranking what
@@ -82,6 +94,9 @@ kept the cursor spinning the longest.
 3. **Resolve the process**: walk up to the root window (`GetAncestor`), get the
    PID (`GetWindowThreadProcessId`), then the image path
    (`QueryFullProcessImageNameW`). `IsHungAppWindow` flags a frozen app.
+4. **Scan for other frozen apps**: while spinning, `EnumWindows` sweeps every
+   visible, titled top-level window and lists any that are also hung, so all the
+   culprit "process(s)" show up — not just the one under the cursor.
 
 ## Limitations / honesty
 

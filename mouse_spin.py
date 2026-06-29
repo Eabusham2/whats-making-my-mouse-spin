@@ -103,10 +103,12 @@ if IS_WINDOWS:
     WM_LBUTTONDBLCLK = 0x0203
     WM_RBUTTONUP = 0x0205
     NIM_ADD = 0
+    NIM_MODIFY = 1
     NIM_DELETE = 2
     NIF_MESSAGE = 0x01
     NIF_ICON = 0x02
     NIF_TIP = 0x04
+    NIF_INFO = 0x10
     TPM_RIGHTBUTTON = 0x0002
     TPM_NONOTIFY = 0x0080
     TPM_RETURNCMD = 0x0100
@@ -175,6 +177,7 @@ if IS_WINDOWS:
 
     WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT,
                                  wintypes.WPARAM, wintypes.LPARAM)
+    WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
     class WNDCLASS(ctypes.Structure):
         _fields_ = [("style", wintypes.UINT),
@@ -206,6 +209,12 @@ if IS_WINDOWS:
     user32.GetGUIThreadInfo.restype = wintypes.BOOL
     user32.IsHungAppWindow.argtypes = [wintypes.HWND]
     user32.IsHungAppWindow.restype = wintypes.BOOL
+    user32.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    user32.GetWindowTextLengthW.restype = ctypes.c_int
     user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
     user32.GetWindowTextW.restype = ctypes.c_int
     user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
@@ -400,28 +409,72 @@ def find_candidates(pos, exclude_hwnds=None, exclude_pids=None):
     return candidates
 
 
+def find_hung_windows(exclude_pids=None, limit=6):
+    """System-wide scan for visible, titled top-level windows that are hung.
+
+    Returns a list of {pid, name, title} de-duplicated by PID. This catches
+    *other* frozen apps too - so you see every process that might be jamming
+    things up, not just the one under the pointer ("process(s)").
+    """
+    exclude_pids = set(exclude_pids or set())
+    found = []
+    seen_pids = set()
+
+    def _cb(hwnd, _lparam):
+        try:
+            if (not user32.IsWindowVisible(hwnd)
+                    or user32.GetWindowTextLengthW(hwnd) == 0
+                    or not user32.IsHungAppWindow(hwnd)):
+                return True
+            pid = wintypes.DWORD(0)
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            pid = pid.value
+            if pid in exclude_pids or pid in seen_pids:
+                return True
+            seen_pids.add(pid)
+            image = _process_image(pid)
+            found.append({
+                "pid": pid,
+                "name": image.rsplit("\\", 1)[-1] if image else None,
+                "title": _window_text(hwnd),
+            })
+        except Exception:
+            pass
+        return True  # keep enumerating
+
+    cb = WNDENUMPROC(_cb)
+    try:
+        user32.EnumWindows(cb, 0)
+    except Exception:
+        pass
+    return found[:limit]
+
+
 def describe_state(exclude_hwnds=None, exclude_pids=None):
-    """High-level: return (kind, detail_text). kind in full/pointer/hidden/none."""
+    """Return (kind, detail_text, primary_culprit_or_None).
+
+    kind is one of "full" / "pointer" / "hidden" / "none".
+    """
     cur = read_cursor()
     if cur is None:
-        return "none", "Could not read the cursor (GetCursorInfo failed)."
+        return "none", "Could not read the cursor (GetCursorInfo failed).", None
     hcur, res_id, showing, pos = cur
 
     if not showing:
         return "hidden", ("Cursor is hidden/suppressed (full-screen app or game) "
-                          "- nothing to attribute.")
+                          "- nothing to attribute."), None
 
     spin = spin_kind(hcur, res_id)
     if spin is None:
         known = KNOWN_CURSORS.get(res_id)
         if known is None:
             known = "custom cursor" if not res_id else "non-spinning (res id %s)" % res_id
-        return "none", "Your cursor is normal: %s.\nNothing is spinning." % known
+        return "none", "Your cursor is normal: %s.\nNothing is spinning." % known, None
 
     short, _desc = spin
     candidates = find_candidates(pos, exclude_hwnds, exclude_pids)
     if not candidates:
-        return short, "Spinning, but I couldn't attribute it to a window/process."
+        return short, "Spinning, but I couldn't attribute it to a window/process.", None
 
     c = candidates[0]
     name = c["name"] or "(name unavailable - run as admin?)"
@@ -430,9 +483,21 @@ def describe_state(exclude_hwnds=None, exclude_pids=None):
         'Window:  "%s"' % (c["title"] or "(no title)"),
         "Via:  %s" % c["via"],
     ]
+    if c["image"]:
+        lines.append("Path:  %s" % c["image"])
     if c["hung"]:
         lines.append("State:  NOT RESPONDING (hung)")
-    return short, "\n".join(lines)
+
+    # Any *other* frozen apps anywhere on the system, not just under the pointer.
+    excl = set(exclude_pids or set()) | {c["pid"]}
+    others = find_hung_windows(exclude_pids=excl)
+    if others:
+        lines.append("")
+        lines.append("Also not responding:")
+        for o in others:
+            lines.append("  - %s (PID %s)" % (o["name"] or "(unknown)", o["pid"]))
+
+    return short, "\n".join(lines), c
 
 
 # --------------------------------------------------------------------------- #
@@ -524,6 +589,20 @@ if IS_WINDOWS:
                     pass
                 self._nid = None
 
+        def notify(self, title, message):
+            """Pop a balloon/toast from the tray icon (used while hidden)."""
+            if not self.active or self._nid is None:
+                return
+            try:
+                self._nid.uFlags = NIF_INFO
+                self._nid.szInfoTitle = title[:63]
+                self._nid.szInfo = message[:255]
+                self._nid.dwInfoFlags = 0
+                shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(self._nid))
+                self._nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
+            except Exception:
+                pass
+
         def _on_message(self, hwnd, msg, wparam, lparam):
             try:
                 if msg == WM_TRAYICON:
@@ -578,12 +657,13 @@ class SpinGuiApp:
         self.window_shown = True
         self.auto_shown = False
         self._last_kind = "none"
+        self._spin_started = None
         self._own_pid = os.getpid()
         self._own_hwnds = set()
 
         root.title("What's making my mouse spin?")
-        root.geometry("470x250")
-        root.minsize(380, 200)
+        root.geometry("540x340")
+        root.minsize(400, 240)
 
         # status area (recoloured each tick)
         self.status_frame = tk.Frame(root)
@@ -592,8 +672,9 @@ class SpinGuiApp:
                                  fg="white", anchor="w", padx=16, pady=8)
         self.headline.pack(fill="x")
         self.detail = tk.Label(self.status_frame, font=("Segoe UI", 11), fg="white",
-                               justify="left", anchor="nw", padx=16)
+                               justify="left", anchor="nw", padx=16, cursor="hand2")
         self.detail.pack(fill="both", expand=True)
+        self.detail.bind("<Button-1>", self._copy_detail)  # click to copy
 
         # controls area (constant dark strip)
         ctrl = tk.Frame(root, bg="#202020")
@@ -691,14 +772,39 @@ class SpinGuiApp:
             except queue.Empty:
                 pass
 
-        kind, text = describe_state(self._own_hwnds, {self._own_pid})
+        prev_kind = self._last_kind
+        kind, text, primary = describe_state(self._own_hwnds, {self._own_pid})
         self._last_kind = kind
+        spinning = kind in ("full", "pointer")
+
         bg, head = STYLES.get(kind, STYLES["none"])
+        now = time.monotonic()
+        if spinning:
+            if self._spin_started is None:
+                self._spin_started = now
+            elapsed = int(now - self._spin_started)
+            if elapsed >= 1:
+                head = "%s   ·   %ds" % (head, elapsed)
+        else:
+            self._spin_started = None
+
         self.status_frame.config(bg=bg)
         self.headline.config(bg=bg, text=head)
         self.detail.config(bg=bg, text=text)
 
-        spinning = kind in ("full", "pointer")
+        # A spin just started: if we're tucked in the tray and not set to pop the
+        # window, fire a balloon toast so the user still finds out.
+        if (spinning and prev_kind not in ("full", "pointer")
+                and self.tray is not None and self.tray.active
+                and not self.window_shown and not self.var_show.get()
+                and primary is not None):
+            nm = primary["name"] or "A process"
+            self.tray.notify(
+                "Your mouse is spinning",
+                "%s (PID %s) %s" % (nm, primary["pid"],
+                                    "is not responding" if primary["hung"] else "is busy"))
+
+        # Auto show/hide when paired with "Hide in tray".
         if self.var_tray.get() and self.var_show.get():
             if spinning and not self.window_shown:
                 self._set_visible(True, auto=True)
@@ -708,6 +814,16 @@ class SpinGuiApp:
             self.root.lift()
 
         self.root.after(POLL_MS, self.tick)
+
+    def _copy_detail(self, _evt=None):
+        try:
+            txt = self.detail.cget("text")
+            if txt:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(txt)
+                self.status_label.config(text="Copied the details to the clipboard.")
+        except Exception:
+            pass
 
     def on_close(self):
         if self.tray is not None:
@@ -719,7 +835,7 @@ class SpinGuiApp:
 # Terminal modes
 # --------------------------------------------------------------------------- #
 def cli_snapshot():
-    kind, text = describe_state()
+    kind, text, _primary = describe_state()
     head = STYLES.get(kind, STYLES["none"])[1]
     if kind in ("full", "pointer"):
         print("SPINNING DETECTED -> %s\n  %s" % (head, text.replace("\n", "\n  ")))
@@ -734,7 +850,7 @@ def cli_watch(interval, duration, _show_all):
     start = time.monotonic()
     try:
         while True:
-            kind, text = describe_state()
+            kind, text, _primary = describe_state()
             spinning = kind in ("full", "pointer")
             if spinning:
                 head = STYLES[kind][1]
