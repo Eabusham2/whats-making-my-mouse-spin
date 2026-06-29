@@ -183,6 +183,7 @@ if IS_WINDOWS:
 
     WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT,
                                  wintypes.WPARAM, wintypes.LPARAM)
+    WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
     class WNDCLASS(ctypes.Structure):
         _fields_ = [("style", wintypes.UINT),
@@ -226,6 +227,12 @@ if IS_WINDOWS:
     user32.GetGUIThreadInfo.restype = wintypes.BOOL
     user32.IsHungAppWindow.argtypes = [wintypes.HWND]
     user32.IsHungAppWindow.restype = wintypes.BOOL
+    user32.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    user32.GetWindowTextLengthW.restype = ctypes.c_int
     user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
     user32.GetWindowTextW.restype = ctypes.c_int
     user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
@@ -446,17 +453,21 @@ def snapshot_processes():
     return out
 
 
-# Folders that legitimate, installed software almost never runs from - a classic
-# malware tell. And "living off the land" binaries that malware loves to abuse.
+# Vocabulary used only to *annotate why* a launch might spin the cursor - script
+# ran, installer in a Temp folder, Office spawned a helper, etc. Not a verdict.
 SUSPECT_DIRS = (
     "\\appdata\\local\\temp\\", "\\windows\\temp\\", "\\temp\\", "\\tmp\\",
     "\\downloads\\", "\\users\\public\\", "\\programdata\\",
     "\\appdata\\roaming\\", "\\$recycle.bin\\",
 )
 LOLBINS = {
-    "powershell.exe", "pwsh.exe", "cmd.exe", "wscript.exe", "cscript.exe",
-    "mshta.exe", "regsvr32.exe", "rundll32.exe", "msbuild.exe", "installutil.exe",
+    "regsvr32.exe", "rundll32.exe", "msbuild.exe", "installutil.exe",
     "certutil.exe", "bitsadmin.exe", "wmic.exe", "schtasks.exe",
+}
+INTERPRETERS = {
+    "powershell.exe", "pwsh.exe", "cmd.exe", "wscript.exe", "cscript.exe",
+    "mshta.exe", "python.exe", "pythonw.exe", "node.exe", "ruby.exe", "perl.exe",
+    "php.exe", "java.exe", "javaw.exe", "dotnet.exe",
 }
 OFFICE_PARENTS = {
     "winword.exe", "excel.exe", "powerpnt.exe", "outlook.exe", "onenote.exe",
@@ -464,38 +475,78 @@ OFFICE_PARENTS = {
 }
 
 
-def suspicious_traits(image, name, parent):
-    """Return (is_suspicious, reasons) using common malware heuristics."""
-    reasons = []
+def launch_notes(image, name, parent):
+    """Plain-language context for why a process might spin the cursor.
+
+    Covers everything - a normal app, a background task, a script/interpreter,
+    an installer in Temp - not just sketchy stuff. Returns a list of short notes.
+    """
+    notes = []
     low = (image or "").lower()
     nm = (name or "").lower()
     par = (parent or "").lower()
 
+    if nm in INTERPRETERS or nm in LOLBINS:
+        notes.append("script/interpreter")
+    if par in OFFICE_PARENTS and (nm in INTERPRETERS or nm in LOLBINS):
+        notes.append("started by an Office app (%s)" % parent)
     for d in SUSPECT_DIRS:
         if d in low:
-            reasons.append("runs from %s" % d.strip("\\"))
+            notes.append("runs from %s" % d.strip("\\"))
             break
-    if not image:
-        reasons.append("image path unreadable (often a protected/hidden process)")
-    if par in OFFICE_PARENTS and nm in LOLBINS:
-        reasons.append("script host spawned by an Office app (%s -> %s)" % (parent, name))
-    elif nm in LOLBINS and par in LOLBINS:
-        reasons.append("script/host chain (%s -> %s)" % (parent, name))
     if nm in LOLBINS and low and "\\system32\\" not in low and "\\syswow64\\" not in low:
-        reasons.append("%s running from outside System32" % name)
-    return (bool(reasons), "; ".join(reasons))
+        notes.append("%s outside System32" % name)
+    if not image:
+        notes.append("path unreadable")
+    return notes
+
+
+def find_hung_windows(exclude_pids=None, limit=6):
+    """Visible, titled top-level windows that are not responding (system-wide)."""
+    exclude_pids = set(exclude_pids or set())
+    found, seen = [], set()
+
+    def _cb(hwnd, _lparam):
+        try:
+            if (not user32.IsWindowVisible(hwnd)
+                    or user32.GetWindowTextLengthW(hwnd) == 0
+                    or not user32.IsHungAppWindow(hwnd)):
+                return True
+            pid = wintypes.DWORD(0)
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            pid = pid.value
+            if pid in exclude_pids or pid in seen:
+                return True
+            seen.add(pid)
+            image = _process_image(pid)
+            found.append({"pid": pid,
+                          "name": image.rsplit("\\", 1)[-1] if image else None,
+                          "title": _window_text(hwnd)})
+        except Exception:
+            pass
+        return True  # keep enumerating
+
+    cb = WNDENUMPROC(_cb)
+    try:
+        user32.EnumWindows(cb, 0)
+    except Exception:
+        pass
+    return found[:limit]
 
 
 class SpinForensics:
-    """Watches process creation so a spin can be tied to what *just launched*.
+    """Explains *why* the cursor is spinning, using every signal at once:
 
-    The "working in background" cursor is the system's "a process is starting"
-    signal - so the strongest lead on a spin is the process that appeared at
-    that moment, plus what spawned it and where it runs from. That is the angle
-    malware trips, which is what this tool is really for.
+      * what process just launched (the "app-starting" trigger),
+      * which window/process actually owns the cursor right now,
+      * anything that is not responding (a hung app freezes the cursor).
+
+    Each launched process is annotated with neutral notes (script/interpreter,
+    runs-from-Temp, started-by-Office, ...) so you can tell a normal app from a
+    background task from a script - whatever the reason turns out to be.
     """
 
-    NEW_WINDOW_S = 6.0   # treat a process this fresh as a spin suspect
+    NEW_WINDOW_S = 6.0   # a process this freshly created is a likely trigger
     HISTORY_S = 90.0
 
     def __init__(self, own_pid):
@@ -523,18 +574,22 @@ class SpinForensics:
         self._snapshot = snap
         return snap
 
-    def _enrich(self, pid, name, ppid):
+    def _enrich(self, pid, name, ppid, via="new-process"):
         image = _process_image(pid)
         parent = self._snapshot.get(ppid, (None, None))[0] or "(parent already exited)"
-        suspicious, why = suspicious_traits(image, name, parent)
         return {
             "name": name or (image.rsplit("\\", 1)[-1] if image else "(unknown)"),
             "pid": pid, "ppid": ppid, "parent": parent, "image": image,
-            "suspicious": suspicious, "why": why, "via": "new-process", "hung": False,
+            "notes": "; ".join(launch_notes(image, name, parent)),
+            "via": via, "hung": False,
         }
 
     def describe(self, exclude_hwnds=None):
-        """Return (kind, detail_text, primary_suspect_or_None)."""
+        """Return (kind, detail_text, primary_cause_or_None).
+
+        The text gathers *every* reason it can find, so you see the whole
+        picture rather than a single guess.
+        """
         cur = read_cursor()
         if cur is None:
             return "none", "Could not read the cursor (GetCursorInfo failed).", None
@@ -553,53 +608,67 @@ class SpinForensics:
 
         short, _desc = spin
         now = time.monotonic()
-        suspects = [(now - ts, pid, nm, ppid)
+        sections = []
+        primary = None
+
+        # 1) What just launched - the classic "app starting" trigger.
+        launched = [(now - ts, pid, nm, ppid)
                     for (ts, pid, nm, ppid) in reversed(self._creations)
                     if now - ts <= self.NEW_WINDOW_S]
-
-        lines = []
-        primary = None
-        if suspects:
-            lines.append("Process(es) that just launched (most likely cause):")
-            for i, (age, pid, nm, ppid) in enumerate(suspects[:6]):
+        if launched:
+            lines = ["Just launched (most likely the trigger):"]
+            for i, (age, pid, nm, ppid) in enumerate(launched[:6]):
                 info = self._enrich(pid, nm, ppid)
-                mark = "  [SUSPICIOUS]" if info["suspicious"] else ""
-                lines.append("  %s  (PID %s, %.1fs ago)%s" % (info["name"], pid, age, mark))
-                lines.append("      parent: %s (PID %s)" % (info["parent"], ppid))
+                tail = "  (%s)" % info["notes"] if info["notes"] else ""
+                lines.append("  - %s  (PID %s, %.1fs ago)  parent: %s%s"
+                             % (info["name"], pid, age, info["parent"], tail))
                 if info["image"]:
-                    lines.append("      path: %s" % info["image"])
-                if info["suspicious"]:
-                    lines.append("      why: %s" % info["why"])
+                    lines.append("        %s" % info["image"])
                 if i == 0:
                     primary = info
-        else:
-            # Nothing new spawned: attribute to the active window for context.
-            cands = find_candidates(pos, exclude_hwnds, {self.own_pid})
-            if cands:
-                c = dict(cands[0])
-                ppid = self._snapshot.get(c["pid"], (None, None))[1]
-                parent = self._snapshot.get(ppid, (None, None))[0] if ppid else None
-                sus, why = suspicious_traits(c["image"], c["name"], parent)
-                c.update({"ppid": ppid or "", "parent": parent or "(unknown)",
-                          "suspicious": sus, "why": why})
+            sections.append("\n".join(lines))
+
+        # 2) Who actually owns the displayed cursor right now.
+        cands = find_candidates(pos, exclude_hwnds, {self.own_pid})
+        if cands:
+            c = dict(cands[0])
+            ppid = self._snapshot.get(c["pid"], (None, None))[1]
+            parent = self._snapshot.get(ppid, (None, None))[0] if ppid else None
+            c.update({"ppid": ppid or "", "parent": parent or "(unknown)",
+                      "notes": "; ".join(launch_notes(c["image"], c["name"], parent))})
+            owner = ("Cursor owned by: %s  (PID %s) [%s]%s"
+                     % (c["name"] or "(unknown)", c["pid"], c["via"],
+                        "   - NOT RESPONDING" if c["hung"] else ""))
+            extra = []
+            if c["title"]:
+                extra.append('window "%s"' % c["title"])
+            if c["notes"]:
+                extra.append(c["notes"])
+            if extra:
+                owner += "\n        " + "; ".join(extra)
+            sections.append(owner)
+            if primary is None:
                 primary = c
-                lines.append("No new process spawned - likely an already-running "
-                             "background task doing work.")
-                lines.append("Closest active window:")
-                mark = "  [SUSPICIOUS]" if sus else ""
-                lines.append("  %s  (PID %s)  [%s]%s"
-                             % (c["name"] or "(unknown)", c["pid"], c["via"], mark))
-                lines.append("      parent: %s (PID %s)" % (c["parent"], c["ppid"]))
-                if c["image"]:
-                    lines.append("      path: %s" % c["image"])
-                if sus:
-                    lines.append("      why: %s" % why)
-                if c["hung"]:
-                    lines.append("      (this window is also not responding)")
-            else:
-                lines.append("Spinning, but nothing new spawned and no window owns "
-                             "the cursor - could be a hidden background process.")
-        return short, "\n".join(lines), primary
+
+        # 3) Anything not responding anywhere - a hung app freezes the cursor.
+        excl = {self.own_pid} | ({primary["pid"]} if primary else set())
+        hung = find_hung_windows(exclude_pids=excl)
+        if hung:
+            lines = ["Not responding (can freeze the cursor):"]
+            for h in hung:
+                lines.append("  - %s (PID %s)" % (h["name"] or "(unknown)", h["pid"]))
+            sections.append("\n".join(lines))
+            if primary is None:
+                h0 = hung[0]
+                primary = {"name": h0["name"], "pid": h0["pid"], "ppid": "",
+                           "parent": "", "image": None, "notes": "not responding",
+                           "via": "hung", "hung": True}
+
+        if not sections:
+            sections.append("Spinning, but I couldn't pin down a cause - possibly a "
+                            "hidden background process with no window.")
+
+        return short, "\n\n".join(sections), primary
 
 
 # --------------------------------------------------------------------------- #
@@ -933,25 +1002,25 @@ class SpinGuiApp:
             nm = primary.get("name", "?")
             pid = primary.get("pid", "?")
             via = primary.get("via", "?")
-            sus = bool(primary.get("suspicious"))
-            tag = "  [SUSPICIOUS]" if sus else ""
+            notes = primary.get("notes", "")
+            tag = "  (%s)" % notes if notes else ""
             line = "%s  %-7s %s (PID %s) via %s%s" % (stamp, kind, nm, pid, via, tag)
         else:
-            nm, pid, sus = "(unattributed)", "?", False
+            nm, pid, notes = "(unattributed)", "?", ""
             line = "%s  %-7s (unattributed)" % (stamp, kind)
         self._log_line(line)
 
         if (self.tray is not None and self.tray.active and not self.window_shown
                 and not self.var_show.get() and primary is not None):
             self.tray.notify("Mouse spin: %s" % kind,
-                             "%s (PID %s)%s" % (nm, pid, " - SUSPICIOUS" if sus else ""))
+                             "%s (PID %s)%s" % (nm, pid, ("  - " + notes) if notes else ""))
 
         if self.var_log.get() and self._log_writer is not None and primary is not None:
             try:
                 self._log_writer.writerow([
                     time.strftime("%Y-%m-%d %H:%M:%S"), kind, nm, pid,
                     primary.get("ppid", ""), primary.get("parent", ""), via,
-                    int(sus), primary.get("why", ""), primary.get("image", "") or ""])
+                    notes, primary.get("image", "") or ""])
                 self._log_fh.flush()
             except Exception:
                 pass
@@ -974,7 +1043,7 @@ class SpinGuiApp:
                 if fresh:
                     self._log_writer.writerow(
                         ["time", "spin", "process", "pid", "ppid", "parent",
-                         "via", "suspicious", "reasons", "path"])
+                         "via", "notes", "path"])
                     self._log_fh.flush()
                 self.status_label.config(text="Logging spins to %s" % self._log_path)
             except Exception:

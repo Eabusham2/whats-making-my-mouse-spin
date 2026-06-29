@@ -4,26 +4,23 @@ Find out **which process is making your mouse cursor spin** — and whether it's
 the **full spin** (the whole pointer becomes a busy ring) or the **pointer
 spin** (a normal arrow with a little spinner, "working in background").
 
-The pointer spin is the system's *"a process is starting / doing work in the
-background"* signal — which is exactly what fires when something launches behind
-your back. So this tool is built to answer **"what just ran?"**: when a spin
-happens it points at the **process that launched at that moment**, what
-**spawned** it, and whether it looks **suspicious** (runs from a Temp/AppData
-folder, a script host spawned by Office, etc.). That makes it handy for
-spotting sketchy background/maybe-malware activity — not just hung apps.
+It answers **"why is my mouse spinning right now?"** by gathering *every* cause
+it can find and showing them together — whatever the reason turns out to be:
 
-For each spin it reports:
-
-- the **process that just launched** (name + PID) and its **parent** process
-- **which kind of spin** (`full` vs `pointer`)
-- a **[SUSPICIOUS]** flag with the reason, for common malware tells
+- the **process that just launched** (name + PID + parent) — the classic
+  "app-starting" trigger, whether that's a normal app, a background task, an
+  installer, or a script;
+- the **window/process that owns the cursor** at that moment;
+- anything **not responding / hung**, since a frozen app freezes the cursor;
+- neutral **notes** on each launch (script/interpreter, runs-from-Temp, started
+  by an Office app, …) so you can tell what *kind* of thing it was;
 - a **spin history** and an optional **CSV log** so you can catch things that
-  happen while you're away
+  happen while you're away;
 - and if it genuinely can't be determined, it tells you so.
 
-> **Not antivirus.** These are heuristics to help you *notice and investigate*
-> background activity. A clean result doesn't mean safe, and a `[SUSPICIOUS]`
-> flag doesn't mean infected — it means "worth a look."
+The notes can double as a heads-up for sketchy activity (a script firing from a
+Temp folder, say), but that's just one of the things it surfaces — this is a
+general "what's spinning my cursor" diagnostic, **not** an antivirus.
 
 > **Platform:** This is a **Windows** tool. The two spinning cursors are a
 > Win32 concept (`IDC_WAIT` and `IDC_APPSTARTING`). On macOS/Linux the idea
@@ -53,9 +50,10 @@ python mouse_spin.py --watch -d 60   # watch 60s, then print a summary
 ### The GUI
 
 A small window that live-updates: **green = no spin, orange = pointer spin,
-red = full spin**. When a spin happens it shows the process(es) that just
-launched, each with its **parent**, **path**, and a **[SUSPICIOUS]** note when a
-malware heuristic matches. It also:
+red = full spin**. When a spin happens it shows, all together: the process(es)
+that just launched (with **parent**, **path**, and **notes**), the
+**window/process that owns the cursor**, and anything **not responding**. It
+also:
 
 - shows **how long** the current spin has lasted (in the headline);
 - keeps a **spin history** panel (newest first) so repeat offenders stand out;
@@ -74,21 +72,25 @@ Four toggles:
   makes your mouse spin, and tucks away again when it stops. (If you leave this
   off while hidden, you instead get a **balloon toast** naming the suspect.)
 - **Log every spin to `mouse_spin_log.csv`** — append every spin event (time,
-  spin type, process, PID, parent, suspicious flag + reasons, path) to a CSV in
-  the working directory, so you can leave it running and review later.
+  spin type, process, PID, parent, notes, path) to a CSV in the working
+  directory, so you can leave it running and review later.
 
 ### The terminal mode
 
-`--watch` is the mode to use for hunting, because it tracks process launches
-over time (a single `--cli` snapshot has no history to compare against).
+`--watch` is the mode to use, because it tracks process launches over time (a
+single `--cli` snapshot has no history to compare against).
 
 ```
 [14:02:07] SPINNING -> pointer spin (working-in-background cursor)
-  Process(es) that just launched (most likely cause):
-    powershell.exe  (PID 9123, 0.3s ago)  [SUSPICIOUS]
-        parent: winword.exe (PID 4477)
-        path: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
-        why: script host spawned by an Office app (winword.exe -> powershell.exe)
+  Just launched (most likely the trigger):
+    - setup.exe  (PID 9123, 0.3s ago)  parent: explorer.exe  (runs from downloads)
+          C:\Users\you\Downloads\setup.exe
+
+  Cursor owned by: explorer.exe  (PID 4477) [under-cursor]
+          window "Downloads"
+
+  Not responding (can freeze the cursor):
+    - Outlook.exe (PID 6789)
 ```
 
 `--watch` samples on an interval and, with `-d`, prints a summary ranking what
@@ -103,30 +105,30 @@ kept the cursor spinning the longest.
    animated `.ani` cursors, where the resource id alone can read back as `0`).
 2. **Track process launches.** Every poll, `CreateToolhelp32Snapshot` lists all
    processes; we diff against the previous list to record what was **just
-   created** (PID, name, parent PID) with a timestamp.
-3. **When a spin fires, blame what just launched.** Any process created in the
-   last few seconds is the prime suspect — that's precisely what the
-   "app-starting" cursor is signalling. For each we resolve the image path
-   (`QueryFullProcessImageNameW`) and the **parent** process, then run malware
-   heuristics:
-   - runs from `Temp` / `AppData` / `Downloads` / `ProgramData` / `Public`;
-   - a script host / LOLBin (`powershell`, `wscript`, `mshta`, `rundll32`, …)
-     **spawned by an Office app**, or a LOLBin chain;
-   - a LOLBin running from **outside `System32`**.
-4. **Fallback.** If nothing new spawned (an already-running process did the
-   work), it attributes to the active window instead — capture window →
-   under-pointer → foreground (`GetGUIThreadInfo` / `WindowFromPoint` /
-   `GetForegroundWindow`) — and still shows the parent + suspicious checks. The
-   tool excludes **its own** PID/window so it never blames itself.
+   created** (PID, name, parent PID) with a timestamp. A process created in the
+   last few seconds is the most likely trigger — that's exactly what the
+   "app-starting" cursor signals. Each is annotated with neutral **notes**
+   (script/interpreter, runs-from-Temp, started-by-Office, outside-System32).
+3. **Find who owns the cursor.** The window controlling the displayed cursor,
+   best candidate first: capture window (`GetGUIThreadInfo` → `hwndCapture`) →
+   under the pointer (`WindowFromPoint`) → foreground (`GetForegroundWindow`),
+   resolved to a PID + image path (`GetAncestor` / `GetWindowThreadProcessId` /
+   `QueryFullProcessImageNameW`).
+4. **Find what's hung.** `EnumWindows` sweeps every visible, titled top-level
+   window and lists any that are **not responding** (`IsHungAppWindow`), since a
+   frozen app freezes the cursor.
+
+All three are shown together. The tool excludes **its own** PID/window so it
+never blames itself.
 
 ## Limitations / honesty
 
-- This is an **investigation aid, not antivirus.** The `[SUSPICIOUS]` flag is a
-  set of cheap heuristics — plenty of legit software runs from `AppData` or uses
-  PowerShell. Treat it as "worth a look," and treat a clean result as "nothing
-  obvious," not "definitely safe."
 - Attribution is a strong heuristic, not proof. Windows doesn't record "process
-  X caused this spin"; we infer it from launch timing and window ownership.
+  X caused this spin"; we infer it from launch timing, window ownership, and
+  hung state.
+- The **notes** are just context (plenty of legit software runs from `AppData`
+  or uses PowerShell). They're a "what kind of thing was this / worth a look"
+  hint, not a verdict — this is **not** antivirus.
 - Very short-lived processes (created and gone between polls) can be missed; run
   `--watch` / leave the GUI open so the poll cadence catches more.
 - If the cursor is **hidden/suppressed** (full-screen games/video), there's
