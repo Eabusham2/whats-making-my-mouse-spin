@@ -23,83 +23,65 @@ For each spin it reports:
 | `full`    | `IDC_WAIT` (`OCR_WAIT`) | `32514` | The entire pointer is a spinning ring ("busy"). |
 | `pointer` | `IDC_APPSTARTING` (`OCR_APPSTARTING`) | `32650` | Arrow **plus** a small spinner ("working in background"). |
 
-## Pick how you want to run it
+## One program — `mouse_spin.py`
 
-| File | Type | Needs | Best for |
-|------|------|-------|----------|
-| `mouse_spin_gui.py` | **GUI** (tkinter) | Python | a live window, no compile |
-| `mouse_spin_detector.py` | CLI | Python | scripting, `--watch` summaries |
-| `Find-MouseSpin.ps1` | CLI | nothing (PowerShell) | zero-install quick check |
-
-All three report the same thing; they just differ in packaging.
-
-## GUI version — `mouse_spin_gui.py`
-
-A small always-on-top window that live-updates: green = no spin, orange =
-pointer spin, red = full spin, and it names the culprit process + PID + whether
-it's hung. Uses `tkinter`, which ships with the standard Windows Python
-installer, so there's nothing to install.
+Everything is in a single file. It needs only Python (the standard Windows
+installer already includes `ctypes` and `tkinter`) — **nothing to `pip install`,
+nothing to compile.**
 
 ```powershell
-python mouse_spin_gui.py
+python mouse_spin.py            # GUI (default)
+python mouse_spin.py --cli      # one-shot snapshot in the terminal
+python mouse_spin.py --watch    # live terminal mode, prints on every change
+python mouse_spin.py --watch -d 60   # watch 60s, then print a summary
 ```
 
-## CLI versions
+### The GUI
 
-### Python (full-featured) — `mouse_spin_detector.py`
+A small window that live-updates: **green = no spin, orange = pointer spin,
+red = full spin**, naming the culprit process + PID + how it was attributed +
+whether the window is hung. Three toggles:
 
-Pure standard library (just `ctypes`), no `pip install` needed.
+- **Always on top** — keep the window above everything else.
+- **Hide in tray (top-arrow area)** — tuck it into the Windows notification
+  area (the `^` overflow by the clock). Left-click the tray icon, or
+  right-click → *Show*, to bring it back; right-click → *Exit* to quit. If the
+  tray can't be created for some reason, it falls back to minimizing so you're
+  never stuck.
+- **Show window when a spin is detected** — pair this with *Hide in tray* and
+  the app lives quietly in the tray, then pops itself up the instant something
+  makes your mouse spin, and tucks away again when it stops.
 
-```powershell
-# one-shot snapshot of the cursor right now
-python mouse_spin_detector.py
-
-# live: print a line every time the spin state changes
-python mouse_spin_detector.py --watch
-
-# watch for 60s, then print a summary of which process spun the most
-python mouse_spin_detector.py --watch -d 60
-
-# also show every candidate window, not just the best guess
-python mouse_spin_detector.py --watch --all
-```
-
-Example output:
+### The terminal mode
 
 ```
 SPINNING DETECTED -> pointer spin (working-in-background cursor)
-  Culprit:  Code.exe  (PID 12345)   [via: under-cursor]
-  Window:   "main.py - Visual Studio Code"  (class Chrome_WidgetWin_1)
-  Path:     C:\Users\you\AppData\Local\Programs\Microsoft VS Code\Code.exe
-  State:    NOT RESPONDING (window is hung)
+  Process:  Code.exe   (PID 12345)
+  Window:  "main.py - Visual Studio Code"
+  Via:  under-cursor
+  State:  NOT RESPONDING (hung)
 ```
 
-### PowerShell (zero install) — `Find-MouseSpin.ps1`
-
-No Python required; PowerShell ships with Windows.
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\Find-MouseSpin.ps1
-powershell -ExecutionPolicy Bypass -File .\Find-MouseSpin.ps1 -Watch
-```
+`--watch` samples on an interval and, with `-d`, prints a summary ranking what
+kept the cursor spinning the longest.
 
 ## How it works
 
-1. **Read the live cursor** with `GetCursorInfo`. `GetIconInfoExW` gives the
-   cursor's resource id, so we identify the *wait* (32514) and *app-starting*
-   (32650) cursors even if you use a custom cursor scheme.
+1. **Read the live cursor** with `GetCursorInfo`. We identify the *wait*
+   (`32514`) and *app-starting* (`32650`) spinners two ways — by the cursor's
+   `GetIconInfoExW` resource id, **and** by comparing the live handle against
+   the current `IDC_WAIT` / `IDC_APPSTARTING` handles (the system spinners are
+   animated `.ani` cursors, where the resource id alone can read back as `0`).
 2. **Attribute it to a window.** The process that owns the window controlling
    the cursor is the culprit. We pick the best candidate in this order:
    1. the window holding **mouse capture** (`GetGUIThreadInfo` → `hwndCapture`),
       which controls the cursor anywhere on screen;
    2. the window **directly under the pointer** (`WindowFromPoint`);
    3. the **foreground** window (`GetForegroundWindow`).
+   The GUI excludes **its own** window/PID so it never blames itself.
 3. **Resolve the process**: walk up to the root window (`GetAncestor`), get the
    PID (`GetWindowThreadProcessId`), then the image path
    (`QueryFullProcessImageNameW`). `IsHungAppWindow` flags a frozen app.
-
-`--watch` samples on an interval and, with `-d`, prints a summary ranking
-processes by how long each kept the cursor spinning.
 
 ## Limitations / honesty
 

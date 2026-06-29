@@ -1,0 +1,811 @@
+#!/usr/bin/env python3
+"""
+whats-making-my-mouse-spin
+==========================
+
+One program that finds out which process is making your mouse cursor "spin" on
+Windows, and shows it in a small live GUI (a terminal mode is included too).
+
+There are two spinning cursors on Windows:
+
+  * FULL SPIN     -> IDC_WAIT (OCR_WAIT, res id 32514)
+                     the whole pointer becomes a spinning ring ("busy").
+  * POINTER SPIN  -> IDC_APPSTARTING (OCR_APPSTARTING, res id 32650)
+                     a normal arrow with a little spinner ("working in background").
+
+For each spin it reports: process name + PID + which kind of spin + whether the
+owning window is hung. If it can't tell, it says so.
+
+GUI (default)
+-------------
+    python mouse_spin.py
+
+The window has three toggles:
+  * Always on top
+  * Hide in tray (the "top-arrow" notification area)
+  * Show window when a spin is detected   (pairs with "Hide in tray": the app
+    lives in the tray and pops up the instant something makes your mouse spin)
+
+Terminal modes
+--------------
+    python mouse_spin.py --cli            # one-shot snapshot, then exit
+    python mouse_spin.py --watch          # live, prints on every change
+    python mouse_spin.py --watch -d 60    # watch 60s, then print a summary
+
+No third-party packages required (pure ctypes + tkinter, both stdlib).
+"""
+
+import argparse
+import os
+import queue
+import sys
+import threading
+import time
+
+IS_WINDOWS = sys.platform == "win32"
+
+POLL_MS = 150  # GUI poll interval
+
+# status kind -> (background colour, headline)
+STYLES = {
+    "full":    ("#aa1e1e", "FULL SPIN"),
+    "pointer": ("#bb7300", "POINTER SPIN"),
+    "hidden":  ("#464646", "CURSOR HIDDEN"),
+    "none":    ("#196e37", "NO SPIN"),
+}
+
+# --------------------------------------------------------------------------- #
+# Win32 bindings (only built on Windows; the file still imports elsewhere so we
+# can print a friendly "not possible here" message instead of crashing).
+# --------------------------------------------------------------------------- #
+if IS_WINDOWS:
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+
+    LPDWORD = ctypes.POINTER(wintypes.DWORD)
+    LRESULT = ctypes.c_ssize_t
+
+    CURSOR_SHOWING = 0x00000001
+    GA_ROOT = 2
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+    OCR_NORMAL = 32512
+    OCR_WAIT = 32514
+    OCR_APPSTARTING = 32650
+
+    SPIN_CURSORS = {
+        OCR_WAIT: ("full", "full spin (busy / wait cursor)"),
+        OCR_APPSTARTING: ("pointer", "pointer spin (working-in-background cursor)"),
+    }
+    KNOWN_CURSORS = {
+        OCR_NORMAL: "arrow (normal)",
+        32513: "I-beam (text)",
+        OCR_WAIT: "wait (full spin)",
+        32515: "crosshair",
+        32649: "hand",
+        OCR_APPSTARTING: "app-starting (pointer spin)",
+        32646: "move",
+        32648: "no / unavailable",
+    }
+
+    # tray / window-message constants
+    WS_POPUP = 0x80000000
+    WM_DESTROY = 0x0002
+    WM_USER = 0x0400
+    WM_TRAYICON = WM_USER + 1
+    WM_TRAY_QUIT = WM_USER + 2
+    WM_LBUTTONUP = 0x0202
+    WM_LBUTTONDBLCLK = 0x0203
+    WM_RBUTTONUP = 0x0205
+    NIM_ADD = 0
+    NIM_DELETE = 2
+    NIF_MESSAGE = 0x01
+    NIF_ICON = 0x02
+    NIF_TIP = 0x04
+    TPM_RIGHTBUTTON = 0x0002
+    TPM_NONOTIFY = 0x0080
+    TPM_RETURNCMD = 0x0100
+    MF_STRING = 0x0000
+    IDI_APPLICATION = 32512
+    ID_TRAY_SHOW = 1001
+    ID_TRAY_EXIT = 1002
+
+    class POINT(ctypes.Structure):
+        _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+    class RECT(ctypes.Structure):
+        _fields_ = [("left", wintypes.LONG), ("top", wintypes.LONG),
+                    ("right", wintypes.LONG), ("bottom", wintypes.LONG)]
+
+    class CURSORINFO(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD),
+                    ("flags", wintypes.DWORD),
+                    ("hCursor", ctypes.c_void_p),
+                    ("ptScreenPos", POINT)]
+
+    class ICONINFOEXW(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD),
+                    ("fIcon", wintypes.BOOL),
+                    ("xHotspot", wintypes.DWORD),
+                    ("yHotspot", wintypes.DWORD),
+                    ("hbmMask", ctypes.c_void_p),
+                    ("hbmColor", ctypes.c_void_p),
+                    ("wResID", wintypes.WORD),
+                    ("szModName", wintypes.WCHAR * 260),
+                    ("szResName", wintypes.WCHAR * 260)]
+
+    class GUITHREADINFO(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD),
+                    ("flags", wintypes.DWORD),
+                    ("hwndActive", wintypes.HWND),
+                    ("hwndFocus", wintypes.HWND),
+                    ("hwndCapture", wintypes.HWND),
+                    ("hwndMenuOwner", wintypes.HWND),
+                    ("hwndMoveSize", wintypes.HWND),
+                    ("hwndCaret", wintypes.HWND),
+                    ("rcCaret", RECT)]
+
+    class GUID(ctypes.Structure):
+        _fields_ = [("Data1", wintypes.DWORD),
+                    ("Data2", wintypes.WORD),
+                    ("Data3", wintypes.WORD),
+                    ("Data4", ctypes.c_byte * 8)]
+
+    class NOTIFYICONDATA(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD),
+                    ("hWnd", wintypes.HWND),
+                    ("uID", wintypes.UINT),
+                    ("uFlags", wintypes.UINT),
+                    ("uCallbackMessage", wintypes.UINT),
+                    ("hIcon", wintypes.HICON),
+                    ("szTip", wintypes.WCHAR * 128),
+                    ("dwState", wintypes.DWORD),
+                    ("dwStateMask", wintypes.DWORD),
+                    ("szInfo", wintypes.WCHAR * 256),
+                    ("uVersion", wintypes.UINT),
+                    ("szInfoTitle", wintypes.WCHAR * 64),
+                    ("dwInfoFlags", wintypes.DWORD),
+                    ("guidItem", GUID),
+                    ("hBalloonIcon", wintypes.HICON)]
+
+    WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT,
+                                 wintypes.WPARAM, wintypes.LPARAM)
+
+    class WNDCLASS(ctypes.Structure):
+        _fields_ = [("style", wintypes.UINT),
+                    ("lpfnWndProc", WNDPROC),
+                    ("cbClsExtra", ctypes.c_int),
+                    ("cbWndExtra", ctypes.c_int),
+                    ("hInstance", wintypes.HINSTANCE),
+                    ("hIcon", wintypes.HICON),
+                    ("hCursor", wintypes.HANDLE),
+                    ("hbrBackground", wintypes.HBRUSH),
+                    ("lpszMenuName", wintypes.LPCWSTR),
+                    ("lpszClassName", wintypes.LPCWSTR)]
+
+    # --- detection bindings ------------------------------------------------- #
+    user32.GetCursorInfo.argtypes = [ctypes.POINTER(CURSORINFO)]
+    user32.GetCursorInfo.restype = wintypes.BOOL
+    user32.GetIconInfoExW.argtypes = [ctypes.c_void_p, ctypes.POINTER(ICONINFOEXW)]
+    user32.GetIconInfoExW.restype = wintypes.BOOL
+    user32.LoadCursorW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    user32.LoadCursorW.restype = ctypes.c_void_p
+    user32.WindowFromPoint.argtypes = [POINT]
+    user32.WindowFromPoint.restype = wintypes.HWND
+    user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+    user32.GetAncestor.restype = wintypes.HWND
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, LPDWORD]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.GetGUIThreadInfo.argtypes = [wintypes.DWORD, ctypes.POINTER(GUITHREADINFO)]
+    user32.GetGUIThreadInfo.restype = wintypes.BOOL
+    user32.IsHungAppWindow.argtypes = [wintypes.HWND]
+    user32.IsHungAppWindow.restype = wintypes.BOOL
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowTextW.restype = ctypes.c_int
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetClassNameW.restype = ctypes.c_int
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, LPDWORD]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    gdi32.DeleteObject.argtypes = [ctypes.c_void_p]
+    gdi32.DeleteObject.restype = wintypes.BOOL
+
+    # --- tray / window bindings --------------------------------------------- #
+    user32.DefWindowProcW.restype = LRESULT
+    user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                      wintypes.WPARAM, wintypes.LPARAM]
+    user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASS)]
+    user32.RegisterClassW.restype = wintypes.ATOM
+    user32.CreateWindowExW.restype = wintypes.HWND
+    user32.CreateWindowExW.argtypes = [
+        wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
+    user32.DestroyWindow.argtypes = [wintypes.HWND]
+    user32.GetMessageW.restype = ctypes.c_int
+    user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND,
+                                   wintypes.UINT, wintypes.UINT]
+    user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    user32.DispatchMessageW.restype = LRESULT
+    user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                    wintypes.WPARAM, wintypes.LPARAM]
+    user32.PostMessageW.restype = wintypes.BOOL
+    user32.PostQuitMessage.argtypes = [ctypes.c_int]
+    user32.LoadIconW.restype = wintypes.HICON
+    user32.LoadIconW.argtypes = [wintypes.HINSTANCE, ctypes.c_void_p]
+    user32.CreatePopupMenu.restype = wintypes.HMENU
+    user32.AppendMenuW.argtypes = [wintypes.HMENU, wintypes.UINT,
+                                   ctypes.c_size_t, wintypes.LPCWSTR]
+    user32.AppendMenuW.restype = wintypes.BOOL
+    user32.TrackPopupMenu.restype = ctypes.c_int
+    user32.TrackPopupMenu.argtypes = [wintypes.HMENU, wintypes.UINT, ctypes.c_int,
+                                      ctypes.c_int, ctypes.c_int, wintypes.HWND,
+                                      wintypes.LPVOID]
+    user32.DestroyMenu.argtypes = [wintypes.HMENU]
+    user32.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]
+    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+    kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+    shell32.Shell_NotifyIconW.restype = wintypes.BOOL
+    shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.POINTER(NOTIFYICONDATA)]
+
+
+# --------------------------------------------------------------------------- #
+# Detection
+# --------------------------------------------------------------------------- #
+def _cursor_res_id(hcursor):
+    """OCR_* resource id of a cursor handle, or None. Robust to custom schemes."""
+    info = ICONINFOEXW()
+    info.cbSize = ctypes.sizeof(ICONINFOEXW)
+    if not user32.GetIconInfoExW(hcursor, ctypes.byref(info)):
+        return None
+    if info.hbmMask:
+        gdi32.DeleteObject(info.hbmMask)
+    if info.hbmColor:
+        gdi32.DeleteObject(info.hbmColor)
+    return int(info.wResID)
+
+
+def read_cursor():
+    """Snapshot the cursor: (hcursor, res_id, showing, (x, y)) or None on failure."""
+    ci = CURSORINFO()
+    ci.cbSize = ctypes.sizeof(CURSORINFO)
+    if not user32.GetCursorInfo(ctypes.byref(ci)):
+        return None
+    showing = bool(ci.flags & CURSOR_SHOWING)
+    pos = (ci.ptScreenPos.x, ci.ptScreenPos.y)
+    hcur = ci.hCursor if (showing and ci.hCursor) else None
+    res_id = _cursor_res_id(ci.hCursor) if (showing and ci.hCursor) else None
+    return hcur, res_id, showing, pos
+
+
+def spin_kind(hcursor, res_id):
+    """Return (short, description) if the cursor is a spinner, else None.
+
+    Two independent checks, because the system busy cursors are animated:
+      1. the OCR_* resource id (reliable for static cursors / custom schemes);
+      2. comparing the live handle to the current IDC_WAIT / IDC_APPSTARTING
+         handles (reliable for the animated .ani system cursors, where the
+         resource id may come back as 0).
+    """
+    if res_id in SPIN_CURSORS:
+        return SPIN_CURSORS[res_id]
+    if hcursor:
+        wait = user32.LoadCursorW(None, OCR_WAIT)
+        appstarting = user32.LoadCursorW(None, OCR_APPSTARTING)
+        if wait and int(hcursor) == int(wait):
+            return SPIN_CURSORS[OCR_WAIT]
+        if appstarting and int(hcursor) == int(appstarting):
+            return SPIN_CURSORS[OCR_APPSTARTING]
+    return None
+
+
+def _window_text(hwnd):
+    buf = ctypes.create_unicode_buffer(512)
+    user32.GetWindowTextW(hwnd, buf, 512)
+    return buf.value
+
+
+def _class_name(hwnd):
+    buf = ctypes.create_unicode_buffer(256)
+    user32.GetClassNameW(hwnd, buf, 256)
+    return buf.value
+
+
+def _process_image(pid):
+    """Full image path for a PID, or None if we can't open the process."""
+    if not pid:
+        return None
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return None
+    try:
+        size = wintypes.DWORD(1024)
+        buf = ctypes.create_unicode_buffer(1024)
+        if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+            return buf.value
+    finally:
+        kernel32.CloseHandle(handle)
+    return None
+
+
+def _describe_window(label, hwnd):
+    """Resolve a window handle into a culprit dict, or None."""
+    if not hwnd:
+        return None
+    root = user32.GetAncestor(hwnd, GA_ROOT) or hwnd
+    pid = wintypes.DWORD(0)
+    tid = user32.GetWindowThreadProcessId(root, ctypes.byref(pid))
+    pid = pid.value
+    image = _process_image(pid)
+    name = image.rsplit("\\", 1)[-1] if image else None
+    return {
+        "via": label,
+        "hwnd": int(root) if root else 0,
+        "pid": pid,
+        "tid": tid,
+        "name": name,
+        "image": image,
+        "title": _window_text(root),
+        "class": _class_name(root),
+        "hung": bool(user32.IsHungAppWindow(root)),
+    }
+
+
+def find_candidates(pos, exclude_hwnds=None, exclude_pids=None):
+    """Ordered list of windows that could own the cursor, best guess first.
+
+    exclude_hwnds / exclude_pids let a caller (e.g. our own GUI) avoid being
+    blamed for the spin it is reporting on.
+    """
+    exclude_hwnds = exclude_hwnds or set()
+    exclude_pids = exclude_pids or set()
+    candidates = []
+    seen = set()
+
+    def add(label, hwnd):
+        if not hwnd or hwnd in seen:
+            return
+        seen.add(hwnd)
+        described = _describe_window(label, hwnd)
+        if not described:
+            return
+        if described["hwnd"] in exclude_hwnds or described["pid"] in exclude_pids:
+            return
+        candidates.append(described)
+
+    # 1) A window with mouse capture controls the cursor anywhere on screen.
+    gti = GUITHREADINFO()
+    gti.cbSize = ctypes.sizeof(GUITHREADINFO)
+    if user32.GetGUIThreadInfo(0, ctypes.byref(gti)) and gti.hwndCapture:
+        add("mouse-capture", gti.hwndCapture)
+
+    # 2) Otherwise the window directly under the pointer sets the cursor.
+    add("under-cursor", user32.WindowFromPoint(POINT(pos[0], pos[1])))
+
+    # 3) Fall back to whatever app is in the foreground.
+    add("foreground", user32.GetForegroundWindow())
+
+    return candidates
+
+
+def describe_state(exclude_hwnds=None, exclude_pids=None):
+    """High-level: return (kind, detail_text). kind in full/pointer/hidden/none."""
+    cur = read_cursor()
+    if cur is None:
+        return "none", "Could not read the cursor (GetCursorInfo failed)."
+    hcur, res_id, showing, pos = cur
+
+    if not showing:
+        return "hidden", ("Cursor is hidden/suppressed (full-screen app or game) "
+                          "- nothing to attribute.")
+
+    spin = spin_kind(hcur, res_id)
+    if spin is None:
+        known = KNOWN_CURSORS.get(res_id)
+        if known is None:
+            known = "custom cursor" if not res_id else "non-spinning (res id %s)" % res_id
+        return "none", "Your cursor is normal: %s.\nNothing is spinning." % known
+
+    short, _desc = spin
+    candidates = find_candidates(pos, exclude_hwnds, exclude_pids)
+    if not candidates:
+        return short, "Spinning, but I couldn't attribute it to a window/process."
+
+    c = candidates[0]
+    name = c["name"] or "(name unavailable - run as admin?)"
+    lines = [
+        "Process:  %s   (PID %s)" % (name, c["pid"]),
+        'Window:  "%s"' % (c["title"] or "(no title)"),
+        "Via:  %s" % c["via"],
+    ]
+    if c["hung"]:
+        lines.append("State:  NOT RESPONDING (hung)")
+    return short, "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# System tray (Windows notification area / "top-arrow" overflow)
+# --------------------------------------------------------------------------- #
+if IS_WINDOWS:
+
+    class SystemTray:
+        """A notification-area icon on its own thread; clicks arrive via a queue.
+
+        events queue yields the strings "show" or "exit". Everything is wrapped
+        defensively so a tray hiccup can never take the GUI down.
+        """
+
+        _counter = 0
+
+        def __init__(self, tooltip="What's making my mouse spin?"):
+            self.tooltip = tooltip
+            self.events = queue.Queue()
+            self.active = False
+            self._hwnd = None
+            self._thread = None
+            self._ready = threading.Event()
+            self._wndproc = None
+            self._nid = None
+            SystemTray._counter += 1
+            self._classname = "MouseSpinTray_%d" % SystemTray._counter
+
+        def start(self, timeout=3.0):
+            if self.active:
+                return True
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+            if self._ready.wait(timeout) and self._hwnd:
+                self.active = True
+                return True
+            return False
+
+        def stop(self):
+            if self._hwnd:
+                try:
+                    user32.PostMessageW(self._hwnd, WM_TRAY_QUIT, 0, 0)
+                except Exception:
+                    pass
+            self.active = False
+
+        def _run(self):
+            try:
+                hinst = kernel32.GetModuleHandleW(None)
+                self._wndproc = WNDPROC(self._on_message)
+                wc = WNDCLASS()
+                wc.lpfnWndProc = self._wndproc
+                wc.hInstance = hinst
+                wc.lpszClassName = self._classname
+                wc.hCursor = user32.LoadCursorW(None, OCR_NORMAL)
+                user32.RegisterClassW(ctypes.byref(wc))
+                self._hwnd = user32.CreateWindowExW(
+                    0, self._classname, "MouseSpinTrayOwner", WS_POPUP,
+                    0, 0, 0, 0, None, None, hinst, None)
+                if not self._hwnd:
+                    self._ready.set()
+                    return
+                self._add_icon()
+                self._ready.set()
+                msg = wintypes.MSG()
+                while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                    user32.TranslateMessage(ctypes.byref(msg))
+                    user32.DispatchMessageW(ctypes.byref(msg))
+            except Exception:
+                self._ready.set()
+
+        def _add_icon(self):
+            nid = NOTIFYICONDATA()
+            nid.cbSize = ctypes.sizeof(NOTIFYICONDATA)
+            nid.hWnd = self._hwnd
+            nid.uID = 1
+            nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
+            nid.uCallbackMessage = WM_TRAYICON
+            nid.hIcon = user32.LoadIconW(None, IDI_APPLICATION)
+            nid.szTip = self.tooltip[:127]
+            shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid))
+            self._nid = nid
+
+        def _remove_icon(self):
+            if self._nid is not None:
+                try:
+                    shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(self._nid))
+                except Exception:
+                    pass
+                self._nid = None
+
+        def _on_message(self, hwnd, msg, wparam, lparam):
+            try:
+                if msg == WM_TRAYICON:
+                    ev = lparam & 0xFFFF
+                    if ev in (WM_LBUTTONUP, WM_LBUTTONDBLCLK):
+                        self.events.put("show")
+                    elif ev == WM_RBUTTONUP:
+                        self._popup_menu(hwnd)
+                    return 0
+                if msg == WM_TRAY_QUIT:
+                    self._remove_icon()
+                    user32.DestroyWindow(hwnd)
+                    return 0
+                if msg == WM_DESTROY:
+                    self._remove_icon()
+                    user32.PostQuitMessage(0)
+                    return 0
+            except Exception:
+                pass
+            return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+        def _popup_menu(self, hwnd):
+            try:
+                menu = user32.CreatePopupMenu()
+                user32.AppendMenuW(menu, MF_STRING, ID_TRAY_SHOW, "Show window")
+                user32.AppendMenuW(menu, MF_STRING, ID_TRAY_EXIT, "Exit")
+                pt = POINT()
+                user32.GetCursorPos(ctypes.byref(pt))
+                user32.SetForegroundWindow(hwnd)
+                cmd = user32.TrackPopupMenu(
+                    menu, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+                    pt.x, pt.y, 0, hwnd, None)
+                user32.PostMessageW(hwnd, 0, 0, 0)  # WM_NULL, per TrackPopupMenu docs
+                user32.DestroyMenu(menu)
+                if cmd == ID_TRAY_SHOW:
+                    self.events.put("show")
+                elif cmd == ID_TRAY_EXIT:
+                    self.events.put("exit")
+            except Exception:
+                self.events.put("show")
+
+
+# --------------------------------------------------------------------------- #
+# GUI
+# --------------------------------------------------------------------------- #
+class SpinGuiApp:
+    def __init__(self, root):
+        import tkinter as tk
+        self.tk = tk
+        self.root = root
+        self.tray = None
+        self.window_shown = True
+        self.auto_shown = False
+        self._last_kind = "none"
+        self._own_pid = os.getpid()
+        self._own_hwnds = set()
+
+        root.title("What's making my mouse spin?")
+        root.geometry("470x250")
+        root.minsize(380, 200)
+
+        # status area (recoloured each tick)
+        self.status_frame = tk.Frame(root)
+        self.status_frame.pack(side="top", fill="both", expand=True)
+        self.headline = tk.Label(self.status_frame, font=("Segoe UI", 20, "bold"),
+                                 fg="white", anchor="w", padx=16, pady=8)
+        self.headline.pack(fill="x")
+        self.detail = tk.Label(self.status_frame, font=("Segoe UI", 11), fg="white",
+                               justify="left", anchor="nw", padx=16)
+        self.detail.pack(fill="both", expand=True)
+
+        # controls area (constant dark strip)
+        ctrl = tk.Frame(root, bg="#202020")
+        ctrl.pack(side="bottom", fill="x")
+        self.var_ontop = tk.BooleanVar(value=True)
+        self.var_tray = tk.BooleanVar(value=False)
+        self.var_show = tk.BooleanVar(value=False)
+
+        def mkcb(text, var, cmd):
+            cb = tk.Checkbutton(ctrl, text=text, variable=var, command=cmd,
+                                bg="#202020", fg="white", selectcolor="#444",
+                                activebackground="#202020", activeforeground="white",
+                                anchor="w", padx=12)
+            cb.pack(fill="x")
+            return cb
+
+        mkcb("Always on top", self.var_ontop, self._apply_ontop)
+        mkcb("Hide in tray (top-arrow area)", self.var_tray, self._apply_tray)
+        mkcb("Show window when a spin is detected", self.var_show, lambda: None)
+        self.status_label = tk.Label(ctrl, text="", bg="#202020", fg="#9a9a9a",
+                                     anchor="w", padx=12, font=("Segoe UI", 8))
+        self.status_label.pack(fill="x")
+
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        # learn our own top-level handle(s) so we never blame ourselves
+        root.update_idletasks()
+        try:
+            child = int(root.winfo_id())
+            root_hwnd = user32.GetAncestor(child, GA_ROOT) or child
+            self._own_hwnds = {child, int(root_hwnd)}
+        except Exception:
+            self._own_hwnds = set()
+
+        self._apply_ontop()
+        self.tick()
+
+    # -- toggles ------------------------------------------------------------ #
+    def _apply_ontop(self):
+        try:
+            self.root.attributes("-topmost", bool(self.var_ontop.get()))
+        except Exception:
+            pass
+
+    def _apply_tray(self):
+        if self.var_tray.get():
+            # a stopped tray can't be cleanly restarted, so start fresh.
+            if self.tray is None or not self.tray.active:
+                self.tray = SystemTray()
+            ok = self.tray.start()
+            if ok:
+                self.status_label.config(
+                    text="Tucked into the tray - click the icon (or right-click > Show) to return.")
+            else:
+                self.status_label.config(
+                    text="System tray unavailable - minimizing to the taskbar instead.")
+            spinning = self._last_kind in ("full", "pointer")
+            if not (self.var_show.get() and spinning):
+                self._set_visible(False)
+        else:
+            if self.tray is not None:
+                self.tray.stop()
+            self.status_label.config(text="")
+            self._set_visible(True)
+
+    # -- visibility --------------------------------------------------------- #
+    def _set_visible(self, visible, auto=False):
+        if visible:
+            self.root.deiconify()
+            self.root.lift()
+            self._apply_ontop()
+            self.window_shown = True
+            self.auto_shown = auto
+        else:
+            if self.tray is not None and self.tray.active:
+                self.root.withdraw()
+            else:
+                self.root.iconify()
+            self.window_shown = False
+            self.auto_shown = False
+
+    # -- main loop ---------------------------------------------------------- #
+    def tick(self):
+        # handle tray clicks first
+        if self.tray is not None:
+            try:
+                while True:
+                    ev = self.tray.events.get_nowait()
+                    if ev == "show":
+                        self.var_tray.set(False)
+                        self._apply_tray()
+                    elif ev == "exit":
+                        self.on_close()
+                        return
+            except queue.Empty:
+                pass
+
+        kind, text = describe_state(self._own_hwnds, {self._own_pid})
+        self._last_kind = kind
+        bg, head = STYLES.get(kind, STYLES["none"])
+        self.status_frame.config(bg=bg)
+        self.headline.config(bg=bg, text=head)
+        self.detail.config(bg=bg, text=text)
+
+        spinning = kind in ("full", "pointer")
+        if self.var_tray.get() and self.var_show.get():
+            if spinning and not self.window_shown:
+                self._set_visible(True, auto=True)
+            elif (not spinning) and self.window_shown and self.auto_shown:
+                self._set_visible(False)
+        elif self.var_show.get() and spinning and self.window_shown:
+            self.root.lift()
+
+        self.root.after(POLL_MS, self.tick)
+
+    def on_close(self):
+        if self.tray is not None:
+            self.tray.stop()
+        self.root.destroy()
+
+
+# --------------------------------------------------------------------------- #
+# Terminal modes
+# --------------------------------------------------------------------------- #
+def cli_snapshot():
+    kind, text = describe_state()
+    head = STYLES.get(kind, STYLES["none"])[1]
+    if kind in ("full", "pointer"):
+        print("SPINNING DETECTED -> %s\n  %s" % (head, text.replace("\n", "\n  ")))
+    else:
+        print("%s - %s" % (head, text.replace("\n", " ")))
+
+
+def cli_watch(interval, duration, _show_all):
+    print("Watching for a spinning cursor (every %gs). Ctrl+C to stop.\n" % interval)
+    stats = {}
+    last = None
+    start = time.monotonic()
+    try:
+        while True:
+            kind, text = describe_state()
+            spinning = kind in ("full", "pointer")
+            if spinning:
+                head = STYLES[kind][1]
+                first = text.splitlines()[0] if text else ""
+                key = (first, kind)
+                stats[key] = stats.get(key, 0) + 1
+                sig = ("spin", key)
+                if sig != last:
+                    stamp = time.strftime("%H:%M:%S")
+                    print("[%s] SPINNING -> %s\n  %s\n"
+                          % (stamp, head, text.replace("\n", "\n  ")))
+                last = sig
+            else:
+                if last is not None and last[0] == "spin":
+                    print("[%s] spin stopped.\n" % time.strftime("%H:%M:%S"))
+                last = ("none",)
+
+            if duration and (time.monotonic() - start) >= duration:
+                break
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\nStopped.")
+
+    if stats:
+        print("\n=== Summary (most spin time first) ===")
+        for (first, kind), count in sorted(stats.items(), key=lambda kv: kv[1], reverse=True):
+            print("  %s  -  %s spin  ~%.1fs" % (first, kind, count * interval))
+    else:
+        print("\nSummary: no spinning cursor was seen.")
+
+
+# --------------------------------------------------------------------------- #
+# Entry point
+# --------------------------------------------------------------------------- #
+def main():
+    parser = argparse.ArgumentParser(
+        description="Find which process is making your mouse cursor spin (Windows).")
+    parser.add_argument("--cli", action="store_true",
+                        help="print one snapshot to the terminal and exit")
+    parser.add_argument("--watch", action="store_true",
+                        help="terminal mode: watch and report changes live")
+    parser.add_argument("-i", "--interval", type=float, default=0.2,
+                        help="poll interval in seconds for --watch (default 0.2)")
+    parser.add_argument("-d", "--duration", type=float, default=0,
+                        help="stop --watch after N seconds (0 = until Ctrl+C)")
+    args = parser.parse_args()
+
+    if not IS_WINDOWS:
+        print("Sorry, this isn't possible on this OS.\n"
+              f"You're on '{sys.platform}'. The spinning mouse cursor (the busy ring "
+              "and the\n'working in background' pointer) is a Windows-specific concept, "
+              "and this tool\nuses the Win32 cursor APIs to detect it.\n\n"
+              "- macOS shows a spinning beach-ball when an *app* stops responding; you'd\n"
+              "  detect that differently (see the README for notes/ideas).\n"
+              "- Linux/X11/Wayland don't have a single global 'busy cursor' to query.\n\n"
+              "Run this on Windows to get process name + PID + spin type.")
+        return 2
+
+    if args.watch:
+        cli_watch(args.interval, args.duration, False)
+        return 0
+    if args.cli:
+        cli_snapshot()
+        return 0
+
+    import tkinter as tk
+    root = tk.Tk()
+    SpinGuiApp(root)
+    root.mainloop()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
