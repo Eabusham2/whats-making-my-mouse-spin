@@ -1032,6 +1032,21 @@ class SpinGuiApp:
             self.window_shown = False
             self.auto_shown = False
 
+    def _reveal_on_spin(self):
+        """Bring the window to the front when a spin starts, whatever hide mode
+        it's in - withdrawn to the tray, minimized, or just behind other windows."""
+        was_hidden = not self.window_shown
+        try:
+            self.root.deiconify()                    # restore tray-withdraw / minimize
+            self.root.lift()
+            self.root.attributes("-topmost", True)   # force above other apps...
+            if not self.var_ontop.get():
+                self.root.after(1500, self._apply_ontop)  # ...then honour the pref
+        except Exception:
+            pass
+        self.window_shown = True
+        self.auto_shown = was_hidden
+
     # -- main loop ---------------------------------------------------------- #
     def tick(self):
         # handle tray clicks first
@@ -1074,14 +1089,16 @@ class SpinGuiApp:
         if spinning and prev_kind not in ("full", "pointer"):
             self._on_spin_start(kind, primary)
 
-        # Auto show/hide when paired with "Hide in tray".
-        if self.var_tray.get() and self.var_show.get():
-            if spinning and not self.window_shown:
-                self._set_visible(True, auto=True)
-            elif (not spinning) and self.window_shown and self.auto_shown:
-                self._set_visible(False)
-        elif self.var_show.get() and spinning and self.window_shown:
-            self.root.lift()
+        # "Show window when a spin is detected": surface it the moment a spin
+        # starts (even if only minimized, not just when hidden in the tray). If
+        # we auto-revealed it from the tray, tuck it away when the spin ends.
+        if self.var_show.get():
+            if spinning and prev_kind not in ("full", "pointer"):
+                self._reveal_on_spin()
+            elif (not spinning) and prev_kind in ("full", "pointer"):
+                if (self.auto_shown and self.var_tray.get()
+                        and self.tray is not None and self.tray.active):
+                    self._set_visible(False)
 
         self.root.after(POLL_MS, self.tick)
 

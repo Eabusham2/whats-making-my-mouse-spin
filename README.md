@@ -69,10 +69,12 @@ Four toggles:
   right-click → *Show*, to bring it back; right-click → *Exit* to quit. If the
   tray can't be created for some reason, it falls back to minimizing so you're
   never stuck.
-- **Show window when a spin is detected** — pair this with *Hide in tray* and
-  the app lives quietly in the tray, then pops itself up the instant something
-  makes your mouse spin, and tucks away again when it stops. (If you leave this
-  off while hidden, you instead get a **balloon toast** naming the suspect.)
+- **Show window when a spin is detected** — the instant a spin starts, the
+  window comes to the front (it restores from the **tray** *or* from a plain
+  **minimize**, and briefly forces itself above other apps). Paired with *Hide
+  in tray* it lives quietly in the tray and tucks away again when the spin ends.
+  (If you leave this toggle off while hidden in the tray, you get a **balloon
+  toast** naming the cause instead.)
 - **Log every spin to `mouse_spin_log.csv`** — append every spin event (time,
   spin type, process, PID, parent, notes, path) to a CSV in the working
   directory, so you can leave it running and review later.
