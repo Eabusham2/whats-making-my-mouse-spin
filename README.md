@@ -58,7 +58,9 @@ that just launched (with **parent**, **path**, and **notes**), the
 also:
 
 - shows **how long** the current spin has lasted (in the headline);
-- keeps a **spin history** panel (newest first) so repeat offenders stand out;
+- keeps a **spin history** panel (newest first, with each spin's **duration**
+  and best-identified cause) so repeat offenders stand out — brief cursor
+  flicker during a launch is debounced into a single entry;
 - lets you **click the details to copy** them to the clipboard.
 
 Four toggles:
@@ -75,9 +77,10 @@ Four toggles:
   in tray* it lives quietly in the tray and tucks away again when the spin ends.
   (If you leave this toggle off while hidden in the tray, you get a **balloon
   toast** naming the cause instead.)
-- **Log every spin to `mouse_spin_log.csv`** — append every spin event (time,
-  spin type, process, PID, parent, notes, path) to a CSV in the working
-  directory, so you can leave it running and review later.
+- **Log every spin to `mouse_spin_log.csv`** — one CSV row per spin (time, spin
+  type, **duration**, process, PID, parent, notes, path), written when the spin
+  ends with the **best cause identified during it**, so you can leave it running
+  and review later.
 
 ### The terminal mode
 

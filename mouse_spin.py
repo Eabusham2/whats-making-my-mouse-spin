@@ -20,11 +20,13 @@ GUI (default)
 -------------
     python mouse_spin.py
 
-The window has three toggles:
+The window has four toggles:
   * Always on top
   * Hide in tray (the "top-arrow" notification area)
   * Show window when a spin is detected   (pairs with "Hide in tray": the app
     lives in the tray and pops up the instant something makes your mouse spin)
+  * Log every spin to mouse_spin_log.csv  (one row per spin, with duration and
+    the best-identified cause)
 
 Terminal modes
 --------------
@@ -909,6 +911,15 @@ if IS_WINDOWS:
 # GUI
 # --------------------------------------------------------------------------- #
 class SpinGuiApp:
+    # Launch cursors flicker (arrow <-> spinner while an app starts), so a spin
+    # only counts as ended after this long with no spin seen. One flickery
+    # launch = one session = one history line / CSV row / reveal.
+    END_GRACE_S = 0.7
+
+    # Higher = stronger evidence of being the actual cause of the spin.
+    _VIA_RANK = {"new-process": 4, "hung": 3, "mouse-capture": 2,
+                 "under-cursor": 2, "foreground": 1, "high-cpu": 1}
+
     def __init__(self, root):
         import tkinter as tk
         self.tk = tk
@@ -918,6 +929,10 @@ class SpinGuiApp:
         self.auto_shown = False
         self._last_kind = "none"
         self._spin_started = None
+        self._in_spin = False           # debounced spin session in progress
+        self._last_spin_seen = 0.0
+        self._spin_best = None          # strongest attribution this session
+        self._spin_start_kind = "none"
         self._own_pid = os.getpid()
         self._own_hwnds = set()
         self.forensics = SpinForensics(self._own_pid)
@@ -1007,8 +1022,7 @@ class SpinGuiApp:
             else:
                 self.status_label.config(
                     text="System tray unavailable - minimizing to the taskbar instead.")
-            spinning = self._last_kind in ("full", "pointer")
-            if not (self.var_show.get() and spinning):
+            if not (self.var_show.get() and self._in_spin):
                 self._set_visible(False)
         else:
             if self.tray is not None:
@@ -1065,71 +1079,95 @@ class SpinGuiApp:
 
         self.forensics.poll()  # keep the process-creation history fresh
 
-        prev_kind = self._last_kind
         kind, text, primary = self.forensics.describe(self._own_hwnds)
         self._last_kind = kind
-        spinning = kind in ("full", "pointer")
+        raw_spinning = kind in ("full", "pointer")
+        now = time.monotonic()
+
+        # Debounced spin session: one flickery launch counts as one spin, and
+        # attribution improves over the session (the launched-process diff can
+        # land a poll after the cursor flips), so we track the best cause seen
+        # and write the history/CSV record when the session ends.
+        if raw_spinning:
+            self._last_spin_seen = now
+            if not self._in_spin:
+                self._in_spin = True
+                self._spin_started = now
+                self._spin_start_kind = kind
+                self._spin_best = None
+                self._on_spin_start(kind, primary)
+            self._spin_best = self._best_cause(self._spin_best, primary)
+        elif self._in_spin and (now - self._last_spin_seen) >= self.END_GRACE_S:
+            self._in_spin = False
+            self._on_spin_end(now - self._spin_started)
 
         bg, head = STYLES.get(kind, STYLES["none"])
-        now = time.monotonic()
-        if spinning:
-            if self._spin_started is None:
-                self._spin_started = now
+        if raw_spinning and self._spin_started is not None:
             elapsed = int(now - self._spin_started)
             if elapsed >= 1:
                 head = "%s   ·   %ds" % (head, elapsed)
-        else:
-            self._spin_started = None
 
         self.status_frame.config(bg=bg)
         self.headline.config(bg=bg, text=head)
         self.detail.config(bg=bg, text=text)
 
-        # A spin just started -> record it in the history (and toast / log).
-        if spinning and prev_kind not in ("full", "pointer"):
-            self._on_spin_start(kind, primary)
-
-        # "Show window when a spin is detected": surface it the moment a spin
-        # starts (even if only minimized, not just when hidden in the tray). If
-        # we auto-revealed it from the tray, tuck it away when the spin ends.
-        if self.var_show.get():
-            if spinning and prev_kind not in ("full", "pointer"):
-                self._reveal_on_spin()
-            elif (not spinning) and prev_kind in ("full", "pointer"):
-                if (self.auto_shown and self.var_tray.get()
-                        and self.tray is not None and self.tray.active):
-                    self._set_visible(False)
-
         self.root.after(POLL_MS, self.tick)
 
+    def _best_cause(self, best, cand):
+        """Keep the strongest attribution seen during one spin session."""
+        if cand is None:
+            return best
+        if best is None:
+            return cand
+        return cand if (self._VIA_RANK.get(cand.get("via"), 0)
+                        > self._VIA_RANK.get(best.get("via"), 0)) else best
+
     def _on_spin_start(self, kind, primary):
-        stamp = time.strftime("%H:%M:%S")
-        if primary:
-            nm = primary.get("name", "?")
-            pid = primary.get("pid", "?")
-            via = primary.get("via", "?")
+        # Immediate signals only: pop the window and/or toast. The history line
+        # and CSV row are written at spin END, with duration and the best cause.
+        if self.var_show.get():
+            self._reveal_on_spin()
+        elif (self.tray is not None and self.tray.active
+              and not self.window_shown and primary is not None):
+            nm = primary.get("name") or "?"
             notes = primary.get("notes", "")
+            self.tray.notify("Mouse spin: %s" % kind,
+                             "%s (PID %s)%s" % (nm, primary.get("pid", "?"),
+                                                ("  - " + notes) if notes else ""))
+
+    def _on_spin_end(self, duration):
+        kind = self._spin_start_kind
+        best = self._spin_best
+        stamp = time.strftime("%H:%M:%S")
+        if best:
+            nm = best.get("name") or "?"
+            pid = best.get("pid", "?")
+            via = best.get("via", "?")
+            notes = best.get("notes", "")
             tag = "  (%s)" % notes if notes else ""
-            line = "%s  %-7s %s (PID %s) via %s%s" % (stamp, kind, nm, pid, via, tag)
+            line = ("%s  %-7s %4.1fs  %s (PID %s) via %s%s"
+                    % (stamp, kind, duration, nm, pid, via, tag))
         else:
-            nm, pid, notes = "(unattributed)", "?", ""
-            line = "%s  %-7s (unattributed)" % (stamp, kind)
+            nm = pid = via = notes = ""
+            line = "%s  %-7s %4.1fs  (unattributed)" % (stamp, kind, duration)
         self._log_line(line)
 
-        if (self.tray is not None and self.tray.active and not self.window_shown
-                and not self.var_show.get() and primary is not None):
-            self.tray.notify("Mouse spin: %s" % kind,
-                             "%s (PID %s)%s" % (nm, pid, ("  - " + notes) if notes else ""))
-
-        if self.var_log.get() and self._log_writer is not None and primary is not None:
+        if self.var_log.get() and self._log_writer is not None:
             try:
                 self._log_writer.writerow([
-                    time.strftime("%Y-%m-%d %H:%M:%S"), kind, nm, pid,
-                    primary.get("ppid", ""), primary.get("parent", ""), via,
-                    notes, primary.get("image", "") or ""])
+                    time.strftime("%Y-%m-%d %H:%M:%S"), kind, "%.1f" % duration,
+                    nm, pid,
+                    best.get("ppid", "") if best else "",
+                    best.get("parent", "") if best else "", via, notes,
+                    (best.get("image", "") or "") if best else ""])
                 self._log_fh.flush()
             except Exception:
                 pass
+
+        # If we auto-revealed the window from the tray, tuck it away again.
+        if (self.auto_shown and self.var_tray.get()
+                and self.tray is not None and self.tray.active):
+            self._set_visible(False)
 
     def _log_line(self, line):
         try:
@@ -1143,13 +1181,14 @@ class SpinGuiApp:
     def _toggle_log(self):
         if self.var_log.get():
             try:
-                fresh = not os.path.exists(self._log_path)
+                fresh = (not os.path.exists(self._log_path)
+                         or os.path.getsize(self._log_path) == 0)
                 self._log_fh = open(self._log_path, "a", newline="", encoding="utf-8")
                 self._log_writer = csv.writer(self._log_fh)
                 if fresh:
                     self._log_writer.writerow(
-                        ["time", "spin", "process", "pid", "ppid", "parent",
-                         "via", "notes", "path"])
+                        ["time", "spin", "duration_s", "process", "pid", "ppid",
+                         "parent", "via", "notes", "path"])
                     self._log_fh.flush()
                 self.status_label.config(text="Logging spins to %s" % self._log_path)
             except Exception:
