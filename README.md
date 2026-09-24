@@ -47,7 +47,21 @@ python mouse_spin.py            # GUI (default)
 python mouse_spin.py --cli      # one-shot snapshot in the terminal
 python mouse_spin.py --watch    # live terminal mode, prints on every change
 python mouse_spin.py --watch -d 60   # watch 60s, then print a summary
+python mouse_spin.py --version  # print the version and exit
 ```
+
+### No Python? Download the .exe
+
+GitHub Actions builds a standalone `mouse_spin.exe` (PyInstaller, no install
+needed) on every push:
+
+- **Latest build:** Actions tab → newest **Test and build** run → *Artifacts*
+  → `mouse_spin-windows-x64` (artifacts expire after 90 days).
+- **Tagged release:** pushing a `v*` tag publishes a GitHub Release with the
+  exe attached — a permanent download link.
+
+The exe takes the same flags (`mouse_spin.exe --watch`). Double-clicking it
+opens the GUI; the console window it briefly shows is closed automatically.
 
 ### The GUI
 
@@ -60,8 +74,11 @@ also:
 - shows **how long** the current spin has lasted (in the headline);
 - keeps a **spin history** panel (newest first, with each spin's **duration**
   and best-identified cause) so repeat offenders stand out — brief cursor
-  flicker during a launch is debounced into a single entry;
-- lets you **click the details to copy** them to the clipboard.
+  flicker during a launch is debounced into a single entry; **Clear** empties
+  it;
+- lets you **click the details to copy** them to the clipboard;
+- keeps polling even if one Win32 query fails mid-spin (a process vanishing
+  between calls used to be able to freeze the display on its last state).
 
 Four toggles:
 
@@ -75,8 +92,9 @@ Four toggles:
   window comes to the front (it restores from the **tray** *or* from a plain
   **minimize**, and briefly forces itself above other apps). Paired with *Hide
   in tray* it lives quietly in the tray and tucks away again when the spin ends.
-  (If you leave this toggle off while hidden in the tray, you get a **balloon
-  toast** naming the cause instead.)
+  (If you leave this toggle off while hidden in the tray, you get one **balloon
+  toast** per spin naming the cause instead — sent when the spin starts if the
+  cause is already known, otherwise when it ends with the best cause found.)
 - **Log every spin to `mouse_spin_log.csv`** — one CSV row per spin (time, spin
   type, **duration**, process, PID, parent, notes, path), written when the spin
   ends with the **best cause identified during it**, so you can leave it running
@@ -100,8 +118,9 @@ single `--cli` snapshot has no history to compare against).
     - Outlook.exe (PID 6789)
 ```
 
-`--watch` samples on an interval and, with `-d`, prints a summary ranking what
-kept the cursor spinning the longest.
+`--watch` samples on an interval and, with `-d` (or on Ctrl+C), prints a summary
+ranking the identified causes (process + PID) by how long each kept the cursor
+spinning.
 
 ## How it works
 
@@ -151,6 +170,19 @@ tool excludes **its own** PID/window so it never blames itself.
   nothing to attribute and the tool says so.
 - Higher-integrity processes (elevated/admin) may show a PID but not a name or
   path unless you run the tool **as Administrator**.
+
+## Development
+
+The Win32 detection only runs on Windows, but the logic around it (launch
+notes, cause ranking, the `--watch` summary) is plain Python with unit tests
+that run anywhere:
+
+```
+python -m unittest -v
+```
+
+CI (`.github/workflows/build.yml`) runs the tests on Linux and Windows, then
+builds `mouse_spin.exe` and publishes it as an artifact / tagged release.
 
 ## Other OSes and ideas
 

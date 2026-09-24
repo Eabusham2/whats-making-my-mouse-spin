@@ -46,9 +46,39 @@ import sys
 import threading
 import time
 
+__version__ = "1.1.0"
+
 IS_WINDOWS = sys.platform == "win32"
 
 POLL_MS = 100  # GUI poll interval (fast enough to catch brief spins)
+
+# Higher = stronger evidence of being the actual cause of a spin.
+VIA_RANK = {"new-process": 4, "hung": 3, "mouse-capture": 2,
+            "under-cursor": 2, "foreground": 1, "high-cpu": 1}
+
+
+def best_cause(best, cand):
+    """Return the stronger of two attributions (dicts with a "via" key).
+
+    Used to keep the best explanation seen during one spin session: the
+    launched-process diff can land a poll or two after the cursor flips, so
+    the cause often improves while a spin is in progress.
+    """
+    if cand is None:
+        return best
+    if best is None:
+        return cand
+    return cand if (VIA_RANK.get(cand.get("via"), 0)
+                    > VIA_RANK.get(best.get("via"), 0)) else best
+
+
+def cause_key(primary):
+    """Short stable label for a cause, e.g. "setup.exe (PID 9123)"."""
+    if not primary:
+        return "(unattributed)"
+    name = primary.get("name") or "(unknown)"
+    pid = primary.get("pid")
+    return "%s (PID %s)" % (name, pid) if pid else name
 
 # status kind -> (background colour, headline)
 STYLES = {
@@ -335,6 +365,31 @@ def read_cursor():
     return hcur, res_id, showing, pos
 
 
+_SYSTEM_SPINNERS = {}   # OCR id -> HCURSOR, refreshed periodically
+_SYSTEM_SPINNERS_T = 0.0
+SPINNER_HANDLE_TTL_S = 5.0   # system cursor handles are stable; re-read rarely
+
+
+def _system_spinner_handles():
+    """Handles of the current IDC_WAIT / IDC_APPSTARTING system cursors.
+
+    LoadCursorW on a system cursor returns a shared handle that only changes
+    when the user switches cursor scheme, so we cache it instead of calling
+    into user32 twice on every 100 ms poll.
+    """
+    global _SYSTEM_SPINNERS, _SYSTEM_SPINNERS_T
+    now = time.monotonic()
+    if not _SYSTEM_SPINNERS or (now - _SYSTEM_SPINNERS_T) > SPINNER_HANDLE_TTL_S:
+        handles = {}
+        for res in (OCR_WAIT, OCR_APPSTARTING):
+            h = user32.LoadCursorW(None, res)
+            if h:
+                handles[res] = int(h)
+        _SYSTEM_SPINNERS = handles
+        _SYSTEM_SPINNERS_T = now
+    return _SYSTEM_SPINNERS
+
+
 def spin_kind(hcursor, res_id):
     """Return (short, description) if the cursor is a spinner, else None.
 
@@ -347,12 +402,10 @@ def spin_kind(hcursor, res_id):
     if res_id in SPIN_CURSORS:
         return SPIN_CURSORS[res_id]
     if hcursor:
-        wait = user32.LoadCursorW(None, OCR_WAIT)
-        appstarting = user32.LoadCursorW(None, OCR_APPSTARTING)
-        if wait and int(hcursor) == int(wait):
-            return SPIN_CURSORS[OCR_WAIT]
-        if appstarting and int(hcursor) == int(appstarting):
-            return SPIN_CURSORS[OCR_APPSTARTING]
+        hc = int(hcursor)
+        for res, handle in _system_spinner_handles().items():
+            if hc == handle:
+                return SPIN_CURSORS[res]
     return None
 
 
@@ -916,10 +969,6 @@ class SpinGuiApp:
     # launch = one session = one history line / CSV row / reveal.
     END_GRACE_S = 0.7
 
-    # Higher = stronger evidence of being the actual cause of the spin.
-    _VIA_RANK = {"new-process": 4, "hung": 3, "mouse-capture": 2,
-                 "under-cursor": 2, "foreground": 1, "high-cpu": 1}
-
     def __init__(self, root):
         import tkinter as tk
         self.tk = tk
@@ -933,6 +982,8 @@ class SpinGuiApp:
         self._last_spin_seen = 0.0
         self._spin_best = None          # strongest attribution this session
         self._spin_start_kind = "none"
+        self._spin_notified = False     # balloon already sent for this session
+        self._tick_failures = 0
         self._own_pid = os.getpid()
         self._own_hwnds = set()
         self.forensics = SpinForensics(self._own_pid)
@@ -954,6 +1005,8 @@ class SpinGuiApp:
                                justify="left", anchor="nw", padx=16, cursor="hand2")
         self.detail.pack(fill="both", expand=True)
         self.detail.bind("<Button-1>", self._copy_detail)  # click to copy
+        # Long image paths would otherwise be clipped at the window edge.
+        self.status_frame.bind("<Configure>", self._fit_detail)
 
         # controls area (constant dark strip)
         ctrl = tk.Frame(root, bg="#202020")
@@ -982,8 +1035,13 @@ class SpinGuiApp:
         # event log (history of spins + suspects), sits above the controls
         logwrap = tk.Frame(root, bg="#151515")
         logwrap.pack(side="bottom", fill="x")
-        tk.Label(logwrap, text="Spin history (newest first):", bg="#151515",
-                 fg="#7fbf7f", anchor="w", padx=12, font=("Segoe UI", 8)).pack(fill="x")
+        loghead = tk.Frame(logwrap, bg="#151515")
+        loghead.pack(fill="x")
+        tk.Label(loghead, text="Spin history (newest first):", bg="#151515",
+                 fg="#7fbf7f", anchor="w", padx=12, font=("Segoe UI", 8)).pack(side="left")
+        tk.Button(loghead, text="Clear", command=self._clear_history, bg="#2a2a2a",
+                  fg="#cfcfcf", activebackground="#3a3a3a", activeforeground="white",
+                  relief="flat", bd=0, padx=8, font=("Segoe UI", 8)).pack(side="right", padx=8)
         self.logbox = tk.Text(logwrap, height=7, bg="#151515", fg="#cfcfcf",
                               insertbackground="#cfcfcf", wrap="none", bd=0,
                               font=("Consolas", 9), padx=12, state="disabled")
@@ -1063,6 +1121,26 @@ class SpinGuiApp:
 
     # -- main loop ---------------------------------------------------------- #
     def tick(self):
+        """One poll. Never lets an exception kill the loop: a single failed
+        Win32 call (e.g. a process that vanished mid-query) used to stop all
+        further polling and freeze the window on its last state."""
+        try:
+            if self._tick_once():
+                return              # window is being closed
+            self._tick_failures = 0
+        except Exception as exc:  # noqa: BLE001 - keep polling no matter what
+            self._tick_failures += 1
+            try:
+                self.status_label.config(
+                    text="Poll error (%s); still watching." % type(exc).__name__)
+            except Exception:
+                pass
+            if self._tick_failures >= 50:
+                return              # something is badly wrong; stop hammering
+        self.root.after(POLL_MS, self.tick)
+
+    def _tick_once(self):
+        """Body of one poll. Returns True if the app is closing."""
         # handle tray clicks first
         if self.tray is not None:
             try:
@@ -1073,7 +1151,7 @@ class SpinGuiApp:
                         self._apply_tray()
                     elif ev == "exit":
                         self.on_close()
-                        return
+                        return True
             except queue.Empty:
                 pass
 
@@ -1095,8 +1173,9 @@ class SpinGuiApp:
                 self._spin_started = now
                 self._spin_start_kind = kind
                 self._spin_best = None
+                self._spin_notified = False
                 self._on_spin_start(kind, primary)
-            self._spin_best = self._best_cause(self._spin_best, primary)
+            self._spin_best = best_cause(self._spin_best, primary)
         elif self._in_spin and (now - self._last_spin_seen) >= self.END_GRACE_S:
             self._in_spin = False
             self._on_spin_end(now - self._spin_started)
@@ -1110,35 +1189,47 @@ class SpinGuiApp:
         self.status_frame.config(bg=bg)
         self.headline.config(bg=bg, text=head)
         self.detail.config(bg=bg, text=text)
+        return False
 
-        self.root.after(POLL_MS, self.tick)
+    def _fit_detail(self, event):
+        try:
+            self.detail.config(wraplength=max(200, event.width - 40))
+        except Exception:
+            pass
 
-    def _best_cause(self, best, cand):
-        """Keep the strongest attribution seen during one spin session."""
-        if cand is None:
-            return best
-        if best is None:
-            return cand
-        return cand if (self._VIA_RANK.get(cand.get("via"), 0)
-                        > self._VIA_RANK.get(best.get("via"), 0)) else best
+    def _hidden_in_tray(self):
+        return (self.tray is not None and self.tray.active
+                and not self.window_shown)
+
+    def _notify(self, kind, primary):
+        """Balloon from the tray naming the cause (only while hidden there)."""
+        if not self._hidden_in_tray() or primary is None:
+            return False
+        nm = primary.get("name") or "?"
+        notes = primary.get("notes", "")
+        self.tray.notify("Mouse spin: %s" % kind,
+                         "%s (PID %s)%s" % (nm, primary.get("pid", "?"),
+                                            ("  - " + notes) if notes else ""))
+        return True
 
     def _on_spin_start(self, kind, primary):
         # Immediate signals only: pop the window and/or toast. The history line
         # and CSV row are written at spin END, with duration and the best cause.
         if self.var_show.get():
             self._reveal_on_spin()
-        elif (self.tray is not None and self.tray.active
-              and not self.window_shown and primary is not None):
-            nm = primary.get("name") or "?"
-            notes = primary.get("notes", "")
-            self.tray.notify("Mouse spin: %s" % kind,
-                             "%s (PID %s)%s" % (nm, primary.get("pid", "?"),
-                                                ("  - " + notes) if notes else ""))
+        elif self._notify(kind, primary):
+            self._spin_notified = True
 
     def _on_spin_end(self, duration):
         kind = self._spin_start_kind
         best = self._spin_best
         stamp = time.strftime("%H:%M:%S")
+
+        # The cause is frequently identified a poll or two after the cursor
+        # flips (the process diff lands late), so if the start-of-spin balloon
+        # had nothing to say, send exactly one now with the best cause found.
+        if not self._spin_notified and not self.var_show.get():
+            self._notify(kind, best)
         if best:
             nm = best.get("name") or "?"
             pid = best.get("pid", "?")
@@ -1175,6 +1266,15 @@ class SpinGuiApp:
             self.logbox.insert("1.0", line + "\n")          # newest on top
             self.logbox.delete("400.0", "end")              # cap the buffer
             self.logbox.config(state="disabled")
+        except Exception:
+            pass
+
+    def _clear_history(self):
+        try:
+            self.logbox.config(state="normal")
+            self.logbox.delete("1.0", "end")
+            self.logbox.config(state="disabled")
+            self.status_label.config(text="History cleared.")
         except Exception:
             pass
 
@@ -1242,22 +1342,27 @@ def cli_snapshot():
               "background/malware culprit far better than a single snapshot.)")
 
 
-def cli_watch(interval, duration, _show_all):
+def cli_watch(interval, duration):
     print("Watching for a spinning cursor (every %gs). Ctrl+C to stop.\n" % interval)
     forensics = SpinForensics(os.getpid())
-    stats = {}
+    stats = {}          # (cause, kind) -> seconds of spin attributed to it
     last = None
     start = time.monotonic()
+    prev_t = start
     try:
         while True:
             forensics.poll()
-            kind, text, _primary = forensics.describe()
+            kind, text, primary = forensics.describe()
+            now = time.monotonic()
+            dt, prev_t = now - prev_t, now
             spinning = kind in ("full", "pointer")
             if spinning:
                 head = STYLES[kind][1]
-                first = text.splitlines()[0] if text else ""
-                key = (first, kind)
-                stats[key] = stats.get(key, 0) + 1
+                # Group by the identified cause (process + PID). Grouping by
+                # the first line of the report would lump every "Just
+                # launched" spin under one generic heading.
+                key = (cause_key(primary), kind)
+                stats[key] = stats.get(key, 0.0) + dt
                 sig = ("spin", key)
                 if sig != last:
                     stamp = time.strftime("%H:%M:%S")
@@ -1269,18 +1374,23 @@ def cli_watch(interval, duration, _show_all):
                     print("[%s] spin stopped.\n" % time.strftime("%H:%M:%S"))
                 last = ("none",)
 
-            if duration and (time.monotonic() - start) >= duration:
+            if duration and (now - start) >= duration:
                 break
             time.sleep(interval)
     except KeyboardInterrupt:
         print("\nStopped.")
 
-    if stats:
-        print("\n=== Summary (most spin time first) ===")
-        for (first, kind), count in sorted(stats.items(), key=lambda kv: kv[1], reverse=True):
-            print("  %s  -  %s spin  ~%.1fs" % (first, kind, count * interval))
-    else:
-        print("\nSummary: no spinning cursor was seen.")
+    print_watch_summary(stats)
+
+
+def print_watch_summary(stats, out=print):
+    """Print the --watch summary: causes ranked by total spin time."""
+    if not stats:
+        out("\nSummary: no spinning cursor was seen.")
+        return
+    out("\n=== Summary (most spin time first) ===")
+    for (cause, kind), secs in sorted(stats.items(), key=lambda kv: kv[1], reverse=True):
+        out("  %s  -  %s spin  ~%.1fs" % (cause, kind, secs))
 
 
 # --------------------------------------------------------------------------- #
@@ -1297,6 +1407,8 @@ def main():
                         help="poll interval in seconds for --watch (default 0.15)")
     parser.add_argument("-d", "--duration", type=float, default=0,
                         help="stop --watch after N seconds (0 = until Ctrl+C)")
+    parser.add_argument("--version", action="version",
+                        version="whats-making-my-mouse-spin %s" % __version__)
     args = parser.parse_args()
 
     if not IS_WINDOWS:
@@ -1311,11 +1423,20 @@ def main():
         return 2
 
     if args.watch:
-        cli_watch(args.interval, args.duration, False)
+        cli_watch(max(0.02, args.interval), args.duration)
         return 0
     if args.cli:
         cli_snapshot()
         return 0
+
+    # The prebuilt mouse_spin.exe is a console build (so --cli/--watch can
+    # print); when it is double-clicked for the GUI, drop the console window
+    # that Windows created just for us.
+    if getattr(sys, "frozen", False):
+        try:
+            kernel32.FreeConsole()
+        except Exception:
+            pass
 
     import tkinter as tk
     root = tk.Tk()

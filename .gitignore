@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 mouse_spin_log.csv
+build/
+dist/
+*.spec
