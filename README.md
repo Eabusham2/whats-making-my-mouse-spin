@@ -201,3 +201,11 @@ builds `mouse_spin.exe` and publishes it as an artifact / tagged release.
   per-process check (CPU spike, or `IsHungAppWindow` across all top-level
   windows) to catch the culprit even in the instant before the cursor flips, and
   to distinguish "busy working" from "frozen/deadlocked."
+
+## Search keywords (ignore)
+
+`mouse-spin`, `spinning-cursor`, `busy-cursor`, `wait-cursor`, `app-starting-cursor`, `windows`,
+`win32`, `cursor-diagnostics`, `mouse-diagnostics`, `process-monitoring`, `process-launches`, `parent-process`,
+`window-ownership`, `hung-applications`, `not-responding`, `cpu-usage`, `background-processes`, `spin-history`,
+`csv-logging`, `command-line`, `terminal-monitor`, `tkinter`, `ctypes`, `python`,
+`system-tray`, `desktop-notifications`, `always-on-top`, `clipboard-copy`, `standalone-executable`, `troubleshooting`
