@@ -92,6 +92,17 @@ def escape_terminal_controls(text):
             escaped.append(char)
     return "".join(escaped)
 
+def spreadsheet_safe_cell(value):
+    """Neutralize formula-like text before writing a spreadsheet-facing CSV."""
+    if not isinstance(value, str) or not value:
+        return value
+    stripped = value.lstrip()
+    leading = value[:len(value) - len(stripped)]
+    if (stripped.startswith(("=", "+", "-", "@"))
+            or any(ord(char) < 32 for char in leading)):
+        return "'" + value
+    return value
+
 # status kind -> (background colour, headline)
 STYLES = {
     "full":    ("#aa1e1e", "FULL SPIN"),
@@ -1261,12 +1272,14 @@ class SpinGuiApp:
 
         if self.var_log.get() and self._log_writer is not None:
             try:
-                self._log_writer.writerow([
+                row = [
                     time.strftime("%Y-%m-%d %H:%M:%S"), kind, "%.1f" % duration,
                     nm, pid,
                     best.get("ppid", "") if best else "",
                     best.get("parent", "") if best else "", via, notes,
-                    (best.get("image", "") or "") if best else ""])
+                    (best.get("image", "") or "") if best else ""]
+                self._log_writer.writerow(
+                    [spreadsheet_safe_cell(value) for value in row])
                 self._log_fh.flush()
             except Exception:
                 pass
