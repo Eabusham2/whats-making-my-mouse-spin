@@ -65,7 +65,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: mouse_spin-windows-x64
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.2.2
         with:
           files: mouse_spin.exe
           generate_release_notes: true
