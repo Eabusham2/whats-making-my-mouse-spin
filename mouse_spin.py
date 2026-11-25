@@ -80,6 +80,18 @@ def cause_key(primary):
     pid = primary.get("pid")
     return "%s (PID %s)" % (name, pid) if pid else name
 
+
+def escape_terminal_controls(text):
+    """Replace C0/C1 terminal controls with visible, inert ASCII escapes."""
+    escaped = []
+    for char in text:
+        code = ord(char)
+        if code < 0x20 or 0x7f <= code <= 0x9f:
+            escaped.append("\\x%02x" % code)
+        else:
+            escaped.append(char)
+    return "".join(escaped)
+
 # status kind -> (background colour, headline)
 STYLES = {
     "full":    ("#aa1e1e", "FULL SPIN"),
@@ -706,11 +718,13 @@ class SpinForensics:
             "via": via, "hung": False,
         }
 
-    def describe(self, exclude_hwnds=None):
+    def describe(self, exclude_hwnds=None, terminal_safe=False):
         """Return (kind, detail_text, primary_cause_or_None).
 
         The text gathers *every* reason it can find, so you see the whole
-        picture rather than a single guess.
+        picture rather than a single guess.  terminal_safe renders controls
+        from peer-controlled window titles visibly for terminal output while
+        preserving the report's own formatting characters.
         """
         cur = read_cursor()
         if cur is None:
@@ -763,7 +777,9 @@ class SpinForensics:
                         "   - NOT RESPONDING" if c["hung"] else ""))
             extra = []
             if c["title"]:
-                extra.append('window "%s"' % c["title"])
+                title = (escape_terminal_controls(c["title"])
+                         if terminal_safe else c["title"])
+                extra.append('window "%s"' % title)
             if c["notes"]:
                 extra.append(c["notes"])
             if extra:
@@ -1331,7 +1347,7 @@ class SpinGuiApp:
 def cli_snapshot():
     forensics = SpinForensics(os.getpid())
     forensics.poll()
-    kind, text, _primary = forensics.describe()
+    kind, text, _primary = forensics.describe(terminal_safe=True)
     head = STYLES.get(kind, STYLES["none"])[1]
     if kind in ("full", "pointer"):
         print("SPINNING DETECTED -> %s\n  %s" % (head, text.replace("\n", "\n  ")))
@@ -1352,7 +1368,7 @@ def cli_watch(interval, duration):
     try:
         while True:
             forensics.poll()
-            kind, text, primary = forensics.describe()
+            kind, text, primary = forensics.describe(terminal_safe=True)
             now = time.monotonic()
             dt, prev_t = now - prev_t, now
             spinning = kind in ("full", "pointer")

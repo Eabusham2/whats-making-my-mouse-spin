@@ -9,6 +9,7 @@ The Win32 detection itself can only be exercised on Windows.
 """
 import io
 import unittest
+from unittest import mock
 
 import mouse_spin as ms
 
@@ -76,6 +77,42 @@ class CauseKeyTests(unittest.TestCase):
 
     def test_missing_name(self):
         self.assertEqual(ms.cause_key({"name": None, "pid": 7}), "(unknown) (PID 7)")
+
+
+class TerminalControlTests(unittest.TestCase):
+    def test_c0_c1_and_delete_are_escaped(self):
+        codes = list(range(0x20)) + [0x7f] + list(range(0x80, 0xa0))
+        controls = "".join(chr(code) for code in codes)
+        expected = "".join("\\x%02x" % code for code in codes)
+        self.assertEqual(ms.escape_terminal_controls(controls), expected)
+
+    def test_printable_window_title_is_preserved(self):
+        title = 'Résumé — setup.exe "ready"'
+        self.assertEqual(ms.escape_terminal_controls(title), title)
+
+    def _describe_title(self, title, terminal_safe):
+        forensics = ms.SpinForensics(999)
+        candidate = {
+            "via": "foreground", "hwnd": 1, "pid": 123, "tid": 456,
+            "name": "app.exe", "image": r"C:\Program Files\App\app.exe",
+            "title": title, "class": "AppWindow", "hung": False,
+        }
+        with mock.patch.object(ms, "read_cursor", return_value=(1, None, True, (0, 0))), \
+                mock.patch.object(ms, "spin_kind", return_value=("full", "full spin")), \
+                mock.patch.object(ms, "find_candidates", return_value=[candidate]), \
+                mock.patch.object(ms, "find_hung_windows", return_value=[]), \
+                mock.patch.object(forensics, "_busy", return_value=[]):
+            return forensics.describe(terminal_safe=terminal_safe)[1]
+
+    def test_terminal_report_escapes_title_controls(self):
+        detail = self._describe_title("ready\x1b[2J\r\b\t\n\x9bspoof", True)
+        self.assertIn(
+            'window "ready\\x1b[2J\\x0d\\x08\\x09\\x0a\\x9bspoof"', detail)
+        self.assertIn('\n        window "', detail)
+
+    def test_gui_report_keeps_original_title(self):
+        title = "first line\nsecond line"
+        self.assertIn('window "%s"' % title, self._describe_title(title, False))
 
 
 class WatchSummaryTests(unittest.TestCase):
