@@ -78,6 +78,25 @@ class CauseKeyTests(unittest.TestCase):
         self.assertEqual(ms.cause_key({"name": None, "pid": 7}), "(unknown) (PID 7)")
 
 
+class SpreadsheetSafeCellTests(unittest.TestCase):
+    def test_formula_prefixes_are_literalized(self):
+        for value in ("=1+1", "+cmd", "-2+3", "@SUM(A1:A2)"):
+            with self.subTest(value=value):
+                self.assertEqual(ms.spreadsheet_safe_cell(value), "'" + value)
+
+    def test_whitespace_bypasses_are_literalized(self):
+        for value in ("  =1+1", "\t+cmd", "\r-2+3", "\n@SUM(A1:A2)",
+                      "\tplain text", " \rplain text"):
+            with self.subTest(value=value):
+                self.assertEqual(ms.spreadsheet_safe_cell(value), "'" + value)
+
+    def test_ordinary_values_are_preserved(self):
+        values = ("setup.exe", r"C:\Program Files\App\app.exe", "", None, 42)
+        for value in values:
+            with self.subTest(value=value):
+                self.assertEqual(ms.spreadsheet_safe_cell(value), value)
+
+
 class WatchSummaryTests(unittest.TestCase):
     def _capture(self, stats):
         buf = io.StringIO()
