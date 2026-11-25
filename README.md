@@ -53,12 +53,16 @@ python mouse_spin.py --version  # print the version and exit
 ### No Python? Download the .exe
 
 GitHub Actions builds a standalone `mouse_spin.exe` (PyInstaller, no install
-needed) on every push:
+needed). Downloadable executables are published only by trusted pushes:
 
-- **Latest build:** Actions tab → newest **Test and build** run → *Artifacts*
-  → `mouse_spin-windows-x64` (artifacts expire after 90 days).
-- **Tagged release:** pushing a `v*` tag publishes a GitHub Release with the
-  exe attached — a permanent download link.
+- **Tagged release (recommended):** open **Releases** and download the exe from
+  the version you want. Pushing a `v*` tag publishes this permanent download.
+- **Latest development build:** Actions tab → **Test and build** → select a
+  successful run whose event is `push` and whose branch is the repository's
+  default branch → *Artifacts* → `mouse_spin-windows-x64` (artifacts expire
+  after 90 days). Verify that the run's commit is the default-branch revision
+  you intend to install. Pull-request, other-branch, and manually dispatched
+  runs do not publish this artifact.
 
 The exe takes the same flags (`mouse_spin.exe --watch`). Double-clicking it
 opens the GUI; the console window it briefly shows is closed automatically.
@@ -182,7 +186,9 @@ python -m unittest -v
 ```
 
 CI (`.github/workflows/build.yml`) runs the tests on Linux and Windows, then
-builds `mouse_spin.exe` and publishes it as an artifact / tagged release.
+builds and smoke-tests `mouse_spin.exe`. Pull requests and other untrusted runs
+still validate the executable, but only default-branch pushes and `v*` tag
+pushes publish the user-facing artifact.
 
 ## Other OSes and ideas
 

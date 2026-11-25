@@ -46,7 +46,12 @@ jobs:
           mouse_spin.py
       - name: Smoke test
         run: dist\mouse_spin.exe --version
-      - uses: actions/upload-artifact@v4
+      - name: Upload trusted executable
+        if: >-
+          github.event_name == 'push' &&
+          (github.ref == format('refs/heads/{0}', github.event.repository.default_branch) ||
+           startsWith(github.ref, 'refs/tags/v'))
+        uses: actions/upload-artifact@v4
         with:
           name: mouse_spin-windows-x64
           path: dist/mouse_spin.exe
@@ -57,7 +62,7 @@ jobs:
   release:
     name: Publish release
     needs: exe
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
