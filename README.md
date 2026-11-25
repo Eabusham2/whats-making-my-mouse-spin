@@ -98,7 +98,9 @@ Four toggles:
 - **Log every spin to `mouse_spin_log.csv`** — one CSV row per spin (time, spin
   type, **duration**, process, PID, parent, notes, path), written when the spin
   ends with the **best cause identified during it**, so you can leave it running
-  and review later.
+  and review later. Normal runs write in the launch directory. Administrator
+  runs write to an administrator-only `WhatsMakingMyMouseSpin` directory under
+  Windows `ProgramData`; the full destination appears below the toggle.
 
 ### The terminal mode
 

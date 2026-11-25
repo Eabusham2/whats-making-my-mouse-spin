@@ -100,6 +100,7 @@ if IS_WINDOWS:
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
     shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
 
     LPDWORD = ctypes.POINTER(wintypes.DWORD)
     LRESULT = ctypes.c_ssize_t
@@ -107,6 +108,39 @@ if IS_WINDOWS:
     CURSOR_SHOWING = 0x00000001
     GA_ROOT = 2
     PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+    # Elevated CSV logging.  The directory and file are owned by the built-in
+    # Administrators group, with access limited to Administrators and SYSTEM.
+    TOKEN_QUERY = 0x0008
+    TOKEN_ELEVATION_CLASS = 20
+    CSIDL_COMMON_APPDATA = 0x0023
+    SHGFP_TYPE_CURRENT = 0
+    SDDL_REVISION_1 = 1
+    SECURE_LOG_SDDL = "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+    ERROR_ALREADY_EXISTS = 183
+    GENERIC_READ = 0x80000000
+    GENERIC_WRITE = 0x40000000
+    READ_CONTROL = 0x00020000
+    FILE_READ_ATTRIBUTES = 0x0080
+    FILE_SHARE_READ = 0x00000001
+    FILE_SHARE_WRITE = 0x00000002
+    OPEN_EXISTING = 3
+    OPEN_ALWAYS = 4
+    FILE_ATTRIBUTE_DIRECTORY = 0x00000010
+    FILE_ATTRIBUTE_NORMAL = 0x00000080
+    FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+    FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+    FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+    OWNER_SECURITY_INFORMATION = 0x00000001
+    DACL_SECURITY_INFORMATION = 0x00000004
+    SE_FILE_OBJECT = 1
+    SE_DACL_PROTECTED = 0x1000
+    ACL_SIZE_INFORMATION_CLASS = 2
+    ACCESS_ALLOWED_ACE_TYPE = 0
+    FILE_ALL_ACCESS = 0x001F01FF
+    WIN_LOCAL_SYSTEM_SID = 22
+    WIN_BUILTIN_ADMINISTRATORS_SID = 26
+    SECURITY_MAX_SID_SIZE = 68
 
     OCR_NORMAL = 32512
     OCR_WAIT = 32514
@@ -245,6 +279,41 @@ if IS_WINDOWS:
         _fields_ = [("dwLowDateTime", wintypes.DWORD),
                     ("dwHighDateTime", wintypes.DWORD)]
 
+    class TOKEN_ELEVATION(ctypes.Structure):
+        _fields_ = [("TokenIsElevated", wintypes.DWORD)]
+
+    class SECURITY_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [("nLength", wintypes.DWORD),
+                    ("lpSecurityDescriptor", wintypes.LPVOID),
+                    ("bInheritHandle", wintypes.BOOL)]
+
+    class BY_HANDLE_FILE_INFORMATION(ctypes.Structure):
+        _fields_ = [("dwFileAttributes", wintypes.DWORD),
+                    ("ftCreationTime", FILETIME),
+                    ("ftLastAccessTime", FILETIME),
+                    ("ftLastWriteTime", FILETIME),
+                    ("dwVolumeSerialNumber", wintypes.DWORD),
+                    ("nFileSizeHigh", wintypes.DWORD),
+                    ("nFileSizeLow", wintypes.DWORD),
+                    ("nNumberOfLinks", wintypes.DWORD),
+                    ("nFileIndexHigh", wintypes.DWORD),
+                    ("nFileIndexLow", wintypes.DWORD)]
+
+    class ACL_SIZE_INFORMATION(ctypes.Structure):
+        _fields_ = [("AceCount", wintypes.DWORD),
+                    ("AclBytesInUse", wintypes.DWORD),
+                    ("AclBytesFree", wintypes.DWORD)]
+
+    class ACE_HEADER(ctypes.Structure):
+        _fields_ = [("AceType", wintypes.BYTE),
+                    ("AceFlags", wintypes.BYTE),
+                    ("AceSize", wintypes.WORD)]
+
+    class ACCESS_ALLOWED_ACE(ctypes.Structure):
+        _fields_ = [("Header", ACE_HEADER),
+                    ("Mask", wintypes.DWORD),
+                    ("SidStart", wintypes.DWORD)]
+
     # --- detection bindings ------------------------------------------------- #
     user32.GetCursorInfo.argtypes = [ctypes.POINTER(CURSORINFO)]
     user32.GetCursorInfo.restype = wintypes.BOOL
@@ -280,6 +349,59 @@ if IS_WINDOWS:
     kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    advapi32.OpenProcessToken.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD, LPDWORD]
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(wintypes.LPVOID), LPDWORD]
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
+    advapi32.GetSecurityInfo.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, wintypes.DWORD,
+        ctypes.POINTER(wintypes.LPVOID), ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.LPVOID), ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.LPVOID)]
+    advapi32.GetSecurityInfo.restype = wintypes.DWORD
+    advapi32.CreateWellKnownSid.argtypes = [
+        ctypes.c_int, wintypes.LPVOID, wintypes.LPVOID, LPDWORD]
+    advapi32.CreateWellKnownSid.restype = wintypes.BOOL
+    advapi32.EqualSid.argtypes = [wintypes.LPVOID, wintypes.LPVOID]
+    advapi32.EqualSid.restype = wintypes.BOOL
+    advapi32.GetSecurityDescriptorControl.argtypes = [
+        wintypes.LPVOID, ctypes.POINTER(wintypes.WORD), LPDWORD]
+    advapi32.GetSecurityDescriptorControl.restype = wintypes.BOOL
+    advapi32.GetAclInformation.argtypes = [
+        wintypes.LPVOID, wintypes.LPVOID, wintypes.DWORD, ctypes.c_int]
+    advapi32.GetAclInformation.restype = wintypes.BOOL
+    advapi32.GetAce.argtypes = [
+        wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.LPVOID)]
+    advapi32.GetAce.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [wintypes.LPVOID]
+    kernel32.LocalFree.restype = wintypes.LPVOID
+    kernel32.CreateDirectoryW.argtypes = [
+        wintypes.LPCWSTR, ctypes.POINTER(SECURITY_ATTRIBUTES)]
+    kernel32.CreateDirectoryW.restype = wintypes.BOOL
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+        ctypes.POINTER(SECURITY_ATTRIBUTES), wintypes.DWORD, wintypes.DWORD,
+        wintypes.HANDLE]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.GetFileInformationByHandle.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(BY_HANDLE_FILE_INFORMATION)]
+    kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+    kernel32.GetFileSizeEx.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(ctypes.c_longlong)]
+    kernel32.GetFileSizeEx.restype = wintypes.BOOL
+    kernel32.GetFinalPathNameByHandleW.argtypes = [
+        wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
+    kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+    shell32.SHGetFolderPathW.argtypes = [
+        wintypes.HWND, ctypes.c_int, wintypes.HANDLE, wintypes.DWORD,
+        wintypes.LPWSTR]
+    shell32.SHGetFolderPathW.restype = ctypes.c_long
     gdi32.DeleteObject.argtypes = [ctypes.c_void_p]
     gdi32.DeleteObject.restype = wintypes.BOOL
 
@@ -334,6 +456,238 @@ if IS_WINDOWS:
         wintypes.HANDLE, ctypes.POINTER(FILETIME), ctypes.POINTER(FILETIME),
         ctypes.POINTER(FILETIME), ctypes.POINTER(FILETIME)]
     kernel32.GetProcessTimes.restype = wintypes.BOOL
+
+
+    def _process_is_elevated():
+        """Return whether this process has a full elevated Windows token.
+
+        Failure is treated as elevated so an uncertain token never falls back
+        to the ordinary, current-directory logging path.
+        """
+        token = wintypes.HANDLE()
+        if not advapi32.OpenProcessToken(
+                kernel32.GetCurrentProcess(), TOKEN_QUERY, ctypes.byref(token)):
+            return True
+        try:
+            elevation = TOKEN_ELEVATION()
+            returned = wintypes.DWORD()
+            if not advapi32.GetTokenInformation(
+                    token, TOKEN_ELEVATION_CLASS, ctypes.byref(elevation),
+                    ctypes.sizeof(elevation), ctypes.byref(returned)):
+                return True
+            return bool(elevation.TokenIsElevated)
+        finally:
+            kernel32.CloseHandle(token)
+
+
+    def _elevated_log_path():
+        """Return the fixed administrator-only ProgramData log path."""
+        common_appdata = ctypes.create_unicode_buffer(32768)
+        result = shell32.SHGetFolderPathW(
+            None, CSIDL_COMMON_APPDATA, None, SHGFP_TYPE_CURRENT, common_appdata)
+        if result != 0:
+            raise OSError("Could not locate the system ProgramData directory")
+        return os.path.join(common_appdata.value, "WhatsMakingMyMouseSpin",
+                            "mouse_spin_log.csv")
+
+
+    def _secure_log_security_attributes():
+        descriptor = wintypes.LPVOID()
+        if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                SECURE_LOG_SDDL, SDDL_REVISION_1,
+                ctypes.byref(descriptor), None):
+            raise ctypes.WinError(ctypes.get_last_error())
+        attributes = SECURITY_ATTRIBUTES(
+            ctypes.sizeof(SECURITY_ATTRIBUTES), descriptor, False)
+        return attributes, descriptor
+
+
+    def _normal_windows_path(path):
+        path = os.path.abspath(path)
+        if path.startswith("\\\\?\\UNC\\"):
+            path = "\\\\" + path[8:]
+        elif path.startswith("\\\\?\\"):
+            path = path[4:]
+        return os.path.normcase(os.path.normpath(path))
+
+
+    def _final_handle_path(handle):
+        buf = ctypes.create_unicode_buffer(32768)
+        length = kernel32.GetFinalPathNameByHandleW(handle, buf, len(buf), 0)
+        if not length:
+            raise ctypes.WinError(ctypes.get_last_error())
+        if length >= len(buf):
+            raise OSError("Resolved log path is too long")
+        return _normal_windows_path(buf.value)
+
+
+    def _well_known_sid(sid_type):
+        sid = ctypes.create_string_buffer(SECURITY_MAX_SID_SIZE)
+        sid_size = wintypes.DWORD(len(sid))
+        if not advapi32.CreateWellKnownSid(
+                sid_type, None, sid, ctypes.byref(sid_size)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return sid
+
+
+    def _handle_has_trusted_security(handle):
+        owner = wintypes.LPVOID()
+        dacl = wintypes.LPVOID()
+        descriptor = wintypes.LPVOID()
+        result = advapi32.GetSecurityInfo(
+            handle, SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            ctypes.byref(owner), None, ctypes.byref(dacl), None,
+            ctypes.byref(descriptor))
+        if result:
+            raise ctypes.WinError(result)
+        try:
+            system_sid = _well_known_sid(WIN_LOCAL_SYSTEM_SID)
+            administrators_sid = _well_known_sid(
+                WIN_BUILTIN_ADMINISTRATORS_SID)
+            if not (advapi32.EqualSid(owner, system_sid)
+                    or advapi32.EqualSid(owner, administrators_sid)):
+                return False
+
+            control = wintypes.WORD()
+            revision = wintypes.DWORD()
+            if not advapi32.GetSecurityDescriptorControl(
+                    descriptor, ctypes.byref(control), ctypes.byref(revision)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            if not control.value & SE_DACL_PROTECTED or not dacl:
+                return False
+
+            acl_info = ACL_SIZE_INFORMATION()
+            if not advapi32.GetAclInformation(
+                    dacl, ctypes.byref(acl_info), ctypes.sizeof(acl_info),
+                    ACL_SIZE_INFORMATION_CLASS):
+                raise ctypes.WinError(ctypes.get_last_error())
+            if acl_info.AceCount != 2:
+                return False
+
+            trusted_sids = (system_sid, administrators_sid)
+            seen = set()
+            for index in range(acl_info.AceCount):
+                ace_pointer = wintypes.LPVOID()
+                if not advapi32.GetAce(dacl, index, ctypes.byref(ace_pointer)):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                ace = ctypes.cast(
+                    ace_pointer, ctypes.POINTER(ACCESS_ALLOWED_ACE)).contents
+                if (ace.Header.AceType != ACCESS_ALLOWED_ACE_TYPE
+                        or ace.Mask != FILE_ALL_ACCESS):
+                    return False
+                sid_pointer = ctypes.c_void_p(
+                    ace_pointer.value + ACCESS_ALLOWED_ACE.SidStart.offset)
+                matches = [i for i, sid in enumerate(trusted_sids)
+                           if advapi32.EqualSid(sid_pointer, sid)]
+                if len(matches) != 1 or matches[0] in seen:
+                    return False
+                seen.add(matches[0])
+            return len(seen) == 2
+        finally:
+            if descriptor:
+                kernel32.LocalFree(descriptor)
+
+
+    def _validate_log_handle(handle, expected_path, directory=False):
+        info = BY_HANDLE_FILE_INFORMATION()
+        if not kernel32.GetFileInformationByHandle(handle, ctypes.byref(info)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT:
+            raise PermissionError("Logging through a reparse point is refused")
+        is_directory = bool(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        if is_directory != directory:
+            raise PermissionError("The logging object has an unexpected type")
+        if _final_handle_path(handle) != _normal_windows_path(expected_path):
+            raise PermissionError("The logging object resolved outside ProgramData")
+        if not _handle_has_trusted_security(handle):
+            raise PermissionError("The logging object has unsafe ownership or ACLs")
+
+
+    def _open_elevated_log_file(path):
+        """Open the protected elevated log once and validate that same handle."""
+        import msvcrt
+
+        expected_path = _elevated_log_path()
+        if _normal_windows_path(path) != _normal_windows_path(expected_path):
+            raise PermissionError("Elevated logging requires the protected path")
+        directory = os.path.dirname(expected_path)
+        attributes, descriptor = _secure_log_security_attributes()
+        directory_handle = None
+        file_handle = None
+        try:
+            if not kernel32.CreateDirectoryW(directory, ctypes.byref(attributes)):
+                error = ctypes.get_last_error()
+                if error != ERROR_ALREADY_EXISTS:
+                    raise ctypes.WinError(error)
+
+            # No FILE_SHARE_DELETE keeps the validated directory from being
+            # replaced while the child file is opened.
+            directory_handle = kernel32.CreateFileW(
+                directory, FILE_READ_ATTRIBUTES | READ_CONTROL,
+                FILE_SHARE_READ | FILE_SHARE_WRITE, None, OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, None)
+            if directory_handle == INVALID_HANDLE_VALUE:
+                raise ctypes.WinError(ctypes.get_last_error())
+            _validate_log_handle(directory_handle, directory, directory=True)
+
+            file_handle = kernel32.CreateFileW(
+                expected_path, GENERIC_READ | GENERIC_WRITE | READ_CONTROL,
+                FILE_SHARE_READ, ctypes.byref(attributes), OPEN_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, None)
+            if file_handle == INVALID_HANDLE_VALUE:
+                raise ctypes.WinError(ctypes.get_last_error())
+            _validate_log_handle(file_handle, expected_path)
+
+            size = ctypes.c_longlong()
+            if not kernel32.GetFileSizeEx(file_handle, ctypes.byref(size)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            fd = msvcrt.open_osfhandle(
+                int(file_handle), os.O_WRONLY | os.O_APPEND | os.O_TEXT)
+            file_handle = None  # ownership transferred to the CRT descriptor
+            try:
+                stream = os.fdopen(
+                    fd, "a", newline="", encoding="utf-8")
+            except Exception:
+                os.close(fd)
+                raise
+            return stream, size.value == 0
+        finally:
+            if file_handle not in (None, INVALID_HANDLE_VALUE):
+                kernel32.CloseHandle(file_handle)
+            if directory_handle not in (None, INVALID_HANDLE_VALUE):
+                kernel32.CloseHandle(directory_handle)
+            kernel32.LocalFree(descriptor)
+
+else:
+    def _process_is_elevated():
+        return False
+
+
+    def _elevated_log_path():
+        raise OSError("Elevated logging is only available on Windows")
+
+
+    def _open_elevated_log_file(_path):
+        raise OSError("Elevated logging is only available on Windows")
+
+
+def _default_log_path(elevated):
+    if elevated:
+        return _elevated_log_path()
+    return os.path.abspath("mouse_spin_log.csv")
+
+
+def _open_log_file(path, elevated):
+    """Open a CSV log and derive header state from the returned handle."""
+    if elevated:
+        return _open_elevated_log_file(path)
+    stream = open(path, "a", newline="", encoding="utf-8")
+    try:
+        return stream, os.fstat(stream.fileno()).st_size == 0
+    except Exception:
+        stream.close()
+        raise
 
 
 # --------------------------------------------------------------------------- #
@@ -987,7 +1341,13 @@ class SpinGuiApp:
         self._own_pid = os.getpid()
         self._own_hwnds = set()
         self.forensics = SpinForensics(self._own_pid)
-        self._log_path = os.path.abspath("mouse_spin_log.csv")
+        self._log_elevated = _process_is_elevated()
+        try:
+            self._log_path = _default_log_path(self._log_elevated)
+        except OSError:
+            # Do not fall back to an attacker-influenced current directory when
+            # the protected elevated destination cannot be determined.
+            self._log_path = None
         self._log_fh = None
         self._log_writer = None
 
@@ -1281,9 +1641,10 @@ class SpinGuiApp:
     def _toggle_log(self):
         if self.var_log.get():
             try:
-                fresh = (not os.path.exists(self._log_path)
-                         or os.path.getsize(self._log_path) == 0)
-                self._log_fh = open(self._log_path, "a", newline="", encoding="utf-8")
+                if self._log_path is None:
+                    raise OSError("No safe log destination is available")
+                self._log_fh, fresh = _open_log_file(
+                    self._log_path, self._log_elevated)
                 self._log_writer = csv.writer(self._log_fh)
                 if fresh:
                     self._log_writer.writerow(
@@ -1293,6 +1654,11 @@ class SpinGuiApp:
                 self.status_label.config(text="Logging spins to %s" % self._log_path)
             except Exception:
                 self.var_log.set(False)
+                if self._log_fh is not None:
+                    try:
+                        self._log_fh.close()
+                    except Exception:
+                        pass
                 self._log_fh = self._log_writer = None
                 self.status_label.config(text="Could not open the log file.")
         else:

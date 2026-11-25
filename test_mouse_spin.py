@@ -9,6 +9,7 @@ The Win32 detection itself can only be exercised on Windows.
 """
 import io
 import unittest
+from unittest import mock
 
 import mouse_spin as ms
 
@@ -107,6 +108,51 @@ class MetaTests(unittest.TestCase):
     def test_styles_cover_all_kinds(self):
         for kind in ("full", "pointer", "hidden", "none"):
             self.assertIn(kind, ms.STYLES)
+
+
+class LogFileTests(unittest.TestCase):
+    def test_elevated_logging_uses_secure_opener(self):
+        opened = (object(), False)
+        with mock.patch.object(ms, "_open_elevated_log_file",
+                               return_value=opened) as secure_open:
+            self.assertIs(ms._open_log_file("protected.csv", True), opened)
+        secure_open.assert_called_once_with("protected.csv")
+
+    def test_elevated_open_failure_does_not_fallback(self):
+        with mock.patch.object(ms, "_open_elevated_log_file",
+                               side_effect=PermissionError("unsafe")), \
+                mock.patch("builtins.open") as ordinary_open:
+            with self.assertRaises(PermissionError):
+                ms._open_log_file("protected.csv", True)
+        ordinary_open.assert_not_called()
+
+    def test_new_log_writes_csv_header(self):
+        app = object.__new__(ms.SpinGuiApp)
+        app.var_log = mock.Mock()
+        app.var_log.get.return_value = True
+        app.status_label = mock.Mock()
+        app._log_path = "mouse_spin_log.csv"
+        app._log_elevated = False
+        stream = io.StringIO()
+        with mock.patch.object(ms, "_open_log_file",
+                               return_value=(stream, True)):
+            app._toggle_log()
+        self.assertTrue(stream.getvalue().startswith(
+            "time,spin,duration_s,process,pid,ppid,parent,via,notes,path"))
+
+    def test_log_open_error_disables_toggle(self):
+        app = object.__new__(ms.SpinGuiApp)
+        app.var_log = mock.Mock()
+        app.var_log.get.return_value = True
+        app.status_label = mock.Mock()
+        app._log_path = "mouse_spin_log.csv"
+        app._log_elevated = True
+        with mock.patch.object(ms, "_open_log_file",
+                               side_effect=PermissionError("unsafe")):
+            app._toggle_log()
+        app.var_log.set.assert_called_once_with(False)
+        self.assertIsNone(app._log_fh)
+        self.assertIsNone(app._log_writer)
 
 
 if __name__ == "__main__":
